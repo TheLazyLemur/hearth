@@ -5,3 +5,6 @@
 # local tooling
 .serena/
 .DS_Store
+
+# session worktrees created by the app
+/.claude/worktrees/
