@@ -1,0 +1,7 @@
+# build output
+/claude-tui
+*.test
+
+# local tooling
+.serena/
+.DS_Store

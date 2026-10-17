@@ -1,0 +1,1457 @@
+package main
+
+import (
+	"cmp"
+	"fmt"
+	"image/color"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/ultraviolet/screen"
+	"github.com/charmbracelet/x/ansi"
+)
+
+var (
+	modes   = []string{"default", "acceptEdits", "plan", "auto"}
+	efforts = []string{"", "low", "medium", "high", "xhigh", "max"}
+	th      = themes["dark"]
+)
+
+const (
+	paneSidebar = iota
+	paneSession
+)
+
+const (
+	focusInput = iota
+	focusView
+)
+
+// prompt is the bottom command line: ":" commands or a one-off question.
+type prompt struct {
+	label    string
+	onSubmit func(string)
+}
+
+// row is one sidebar line: a project header (s == nil) or a session under it.
+type row struct {
+	project string
+	s       *Session
+}
+
+func (r row) key() string {
+	if r.s == nil {
+		return "p:" + r.project
+	}
+	return r.s.SessionID
+}
+
+// groupRows groups sessions under their project (originCwd). Projects are ordered by
+// their first session in vs, so the project holding the most recent/starred work leads.
+func groupRows(vs []*Session, collapsed map[string]bool) []row {
+	var order []string
+	by := map[string][]*Session{}
+	for _, s := range vs {
+		if _, ok := by[s.OriginCwd]; !ok {
+			order = append(order, s.OriginCwd)
+		}
+		by[s.OriginCwd] = append(by[s.OriginCwd], s)
+	}
+	var rows []row
+	for _, p := range order {
+		rows = append(rows, row{project: p})
+		if !collapsed[p] {
+			for _, s := range by[p] {
+				rows = append(rows, row{project: p, s: s})
+			}
+		}
+	}
+	return rows
+}
+
+type UI struct {
+	app          *App
+	scr          *uv.TerminalScreen
+	ctx          *screen.Context
+	pane         int
+	insert       bool   // session pane in INSERT mode
+	sel          string // selected sidebar row key
+	cur          string // session shown in the main pane
+	collapsed    map[string]bool
+	focus        int            // session pane: focusInput or focusView
+	ed           editor         // the prompt, vim-edited (ported from grimalkin)
+	tv           transcriptView // the transcript cursor (ported from grimalkin)
+	register     []rune         // yank register shared by the prompt and the transcript
+	slines       []screenLine   // transcript as last drawn, for the view's motions
+	raw          bool           // replies were last drawn as raw markdown (visual mode)
+	input        []rune         // ":" command line / one-off question
+	pos          int
+	view         int // transcript height at last draw, for paging
+	showArchived bool
+	prompt       *prompt
+	op           string // pending vim operator: g, d, z
+	permSel      int    // highlighted permission dialog option
+	help         bool   // shortcut hints shown under the footer
+	quit         bool
+}
+
+func main() {
+	app, err := newApp(defaultStore())
+	if err != nil {
+		log.Fatal(err)
+	}
+	t := uv.DefaultTerminal()
+	scr := t.Screen()
+	scr.EnterAltScreen()
+	scr.EnableBracketedPaste()
+	if err := t.Start(); err != nil {
+		log.Fatal(err)
+	}
+	th = loadTheme()
+	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
+	defer tick.Stop()
+	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}}
+	if vs := app.visible(false); len(vs) > 0 {
+		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
+	}
+	defer func() {
+		app.closeAll()
+		t.Stop()
+	}()
+	for !u.quit {
+		select {
+		case ev, ok := <-t.Events():
+			if !ok {
+				return
+			}
+			u.event(ev)
+		case m := <-app.agentCh:
+			app.handle(m)
+		case <-tick.C:
+			if !app.anyRunning() {
+				continue
+			}
+		}
+		u.draw()
+	}
+}
+
+func (u *UI) rows() []row { return groupRows(u.app.visible(u.showArchived), u.collapsed) }
+
+// selRow returns the selected sidebar row, falling back to the first one.
+func (u *UI) selRow() (row, int, []row) {
+	rs := u.rows()
+	for i, r := range rs {
+		if r.key() == u.sel {
+			return r, i, rs
+		}
+	}
+	if len(rs) == 0 {
+		return row{}, -1, rs
+	}
+	u.sel = rs[0].key()
+	return rs[0], 0, rs
+}
+
+// session is the one shown in the main pane.
+func (u *UI) session() *Session {
+	if s := u.app.find(u.cur); s != nil && s.IsArchived == u.showArchived {
+		return s
+	}
+	if vs := u.app.visible(u.showArchived); len(vs) > 0 {
+		u.cur = vs[0].SessionID
+		return vs[0]
+	}
+	return nil
+}
+
+func (u *UI) open(s *Session) {
+	u.cur, u.sel, u.tv, u.focus = s.SessionID, s.SessionID, transcriptView{}, focusInput
+	u.collapsed[s.OriginCwd] = false
+}
+
+func (u *UI) ask(label, initial string, f func(string)) {
+	u.input = []rune(initial)
+	u.pos = len(u.input)
+	u.prompt = &prompt{label, f}
+}
+
+func (u *UI) closePrompt() {
+	u.prompt, u.input, u.pos = nil, nil, 0
+}
+
+func (u *UI) event(ev uv.Event) {
+	switch ev := ev.(type) {
+	case uv.WindowSizeEvent:
+		u.scr.Resize(ev.Width, ev.Height)
+	case uv.PasteEvent:
+		text := strings.ReplaceAll(ev.Content, "\r\n", "\n")
+		switch {
+		case u.prompt != nil:
+			u.insertText(text)
+		case u.pane == paneSession && u.focus == focusInput:
+			u.ed.insertText([]rune(text))
+		}
+	case uv.KeyPressEvent:
+		u.app.notice = ""
+		u.key(ev)
+	}
+}
+
+func (u *UI) key(k uv.KeyPressEvent) {
+	s := u.session()
+	if k.MatchString("ctrl+c") {
+		if s != nil && u.app.status(s) == "running" {
+			u.app.interrupt(s)
+		} else {
+			u.app.notice = "type :q to quit"
+		}
+		return
+	}
+	if u.prompt != nil {
+		u.promptKey(k)
+		return
+	}
+	if s != nil && u.pane == paneSession {
+		switch {
+		case len(u.app.L(s.SessionID).perms) > 0 && u.app.L(s.SessionID).perms[0].Answers == nil:
+			u.cardKey(s, k)
+		case k.MatchString("shift+tab"):
+			u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+		case u.focus == focusView:
+			u.viewKey(s, k)
+		default:
+			u.inputKey(s, k)
+		}
+		return
+	}
+	// sidebar: two-key vim sequences (gg, dd, za) build up in u.op
+	seq := u.op + k.String()
+	u.op = ""
+	if seq == "g" || seq == "d" || seq == "z" {
+		u.op = seq
+		return
+	}
+	switch {
+	case seq == ":":
+		u.ask(":", "", u.command)
+	case seq == "?":
+		u.help = !u.help
+	case k.MatchString("ctrl+l"):
+		if s != nil {
+			u.pane = paneSession
+		}
+	case k.MatchString("shift+tab") && s != nil:
+		u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+	default:
+		u.sidebarKey(seq)
+	}
+}
+
+func (u *UI) sidebarKey(seq string) {
+	r, i, rs := u.selRow()
+	if i < 0 {
+		if seq == "o" || seq == "O" {
+			u.ask(":", "e "+shortPath(u.app.launched), u.command)
+		}
+		return
+	}
+	move := func(j int) {
+		j = max(0, min(len(rs)-1, j))
+		u.sel = rs[j].key()
+		if rs[j].s != nil {
+			u.cur, u.tv = rs[j].s.SessionID, transcriptView{}
+		}
+	}
+	switch seq {
+	case "j", "down":
+		move(i + 1)
+	case "k", "up":
+		move(i - 1)
+	case "gg":
+		move(0)
+	case "G":
+		move(len(rs) - 1)
+	case "l", "enter", "right":
+		if r.s == nil {
+			u.collapsed[r.project] = !u.collapsed[r.project]
+		} else {
+			u.open(r.s)
+			u.pane = paneSession
+		}
+	case "h", "left":
+		if r.s != nil {
+			u.sel = "p:" + r.project
+		} else {
+			u.collapsed[r.project] = true
+		}
+	case "za":
+		u.collapsed[r.project] = !u.collapsed[r.project]
+		u.sel = "p:" + r.project
+	case "o":
+		u.newSessionIn(r.project)
+	case "O":
+		u.ask(":", "e ", u.command)
+	case "A":
+		u.showArchived = !u.showArchived
+		u.sel = ""
+	}
+	if r.s == nil {
+		return
+	}
+	switch seq {
+	case "r":
+		u.ask(":", "rename "+r.s.Title, u.command)
+	case "s":
+		r.s.IsStarred = !r.s.IsStarred
+		u.app.save(r.s)
+	case "a":
+		r.s.IsArchived = !r.s.IsArchived
+		u.app.save(r.s)
+	case "dd":
+		u.confirmDelete(r.s)
+	}
+}
+
+// inputKey edits the prompt: grimalkin's vim editor plus the session's own chords.
+func (u *UI) inputKey(s *Session, k uv.KeyPressEvent) {
+	char, key := translateKey(k)
+	normal := u.ed.mode == modeNormal
+	switch {
+	case k.MatchString("ctrl+s"):
+		u.submit(s, true)
+		return
+	case key == keyNewline:
+		if !normal {
+			u.ed.insertText([]rune("\n"))
+		}
+		return
+	case key == keyPageUp || key == keyCtrlB: // page up from the prompt lands in the transcript
+		u.focusView()
+		u.viewKey(s, k)
+		return
+	case normal && char == ':':
+		u.ask(":", "", u.command)
+		return
+	case normal && char == '?':
+		u.help = !u.help
+		return
+	case normal && key == keyEsc:
+		u.app.interrupt(s)
+		return
+	case normal && k.MatchString("ctrl+h"):
+		u.pane = paneSidebar
+		return
+	}
+	switch u.ed.handleKey(&u.register, char, key) {
+	case editorSend:
+		u.submit(s, false)
+	case editorFocusTranscript:
+		u.focusView()
+	}
+}
+
+// viewKey moves the transcript cursor; keys the view leaves free run session commands.
+func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
+	char, key := translateKey(k)
+	tv := &u.tv
+	if !tv.search.typing && tv.visual == visualOff && tv.pendingKey == 0 && !tv.pendingWindowCmd {
+		op := u.op
+		u.op = ""
+		switch {
+		case key == keyEsc && tv.search.pattern == nil:
+			u.app.interrupt(s)
+			return
+		case k.MatchString("ctrl+h"):
+			u.pane = paneSidebar
+			return
+		case char == 'd' && op == "d":
+			u.confirmDelete(s)
+			return
+		case char == 'd':
+			u.op = "d"
+			return
+		case char == 'x':
+			u.unqueue(s)
+			return
+		case char == 'm':
+			u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+			return
+		case char == 'M':
+			u.ask(":", "model "+s.Model, u.command)
+			return
+		case char == 'R':
+			u.ask(":", "rewind ", u.command)
+			return
+		case char == 't':
+			u.ask(":", "task 1", u.command)
+			return
+		}
+	}
+	act := tv.handleKey(u.slines, u.view, &u.register, char, key)
+	if tv.note != "" {
+		u.app.notice, tv.note = tv.note, ""
+	}
+	switch act {
+	case viewInsert:
+		u.focus = focusInput
+		u.ed.startInsert(len(u.ed.text))
+	case viewFocusInput:
+		u.focus, u.ed.mode = focusInput, modeNormal
+		u.ed.clampCursor()
+	case viewYanked:
+		u.yanked()
+	case viewCommand:
+		u.ask(":", "", u.command)
+	case viewQuit:
+		u.app.notice = "type :q to quit"
+	}
+}
+
+func (u *UI) focusView() {
+	u.focus = focusView
+	u.tv.focusLastLine(u.slines, u.view)
+}
+
+// submit sends the prompt (queued by the CLI if a turn is running), or answers a question.
+func (u *UI) submit(s *Session, interrupt bool) {
+	l := u.app.L(s.SessionID)
+	text := strings.TrimSpace(string(u.ed.text))
+	if text == "" {
+		return
+	}
+	var err error
+	switch {
+	case len(l.perms) > 0: // AskUserQuestion answer
+		u.answerQuestion(s, l.perms[0], text)
+	case interrupt:
+		err = u.app.interruptAndSend(s, text)
+	default:
+		err = u.app.send(s, text)
+	}
+	if err != nil {
+		u.app.notice = err.Error()
+		return
+	}
+	u.ed.reset()
+}
+
+func (u *UI) unqueue(s *Session) {
+	u.must(u.app.unqueue(s, func(text string) {
+		u.ed.text, u.focus = []rune(text), focusInput
+		u.ed.startInsert(len(u.ed.text))
+	}))
+}
+
+// yanked copies a transcript yank to the macOS clipboard too, as grimalkin does.
+func (u *UI) yanked() {
+	cmd := exec.Command("pbcopy")
+	cmd.Stdin = strings.NewReader(string(u.register))
+	if err := cmd.Run(); err != nil {
+		u.app.notice = "yanked; clipboard: " + err.Error()
+		return
+	}
+	u.app.notice = fmt.Sprintf("yanked %d characters", len(u.register))
+}
+
+// cardKey drives the permission dialog: j/k or arrows and enter, a number, or esc to deny.
+func (u *UI) cardKey(s *Session, k uv.KeyPressEvent) {
+	opts := permOptions(u.app.L(s.SessionID).perms[0])
+	pick := -1
+	switch {
+	case k.MatchString("j", "down", "tab"):
+		u.permSel = (u.permSel + 1) % len(opts)
+	case k.MatchString("k", "up", "shift+tab"):
+		u.permSel = (u.permSel + len(opts) - 1) % len(opts)
+	case k.MatchString("enter"):
+		pick = u.permSel
+	case k.MatchString("esc"):
+		pick = len(opts) - 1
+	case k.MatchString("ctrl+h"):
+		u.pane = paneSidebar
+	default:
+		if n, err := strconv.Atoi(k.Text); err == nil && n >= 1 && n <= len(opts) {
+			pick = n - 1
+		}
+	}
+	if pick >= 0 {
+		u.permSel = 0
+		u.must(u.app.answerPerm(s, opts[pick].allow, opts[pick].always))
+	}
+}
+
+func (u *UI) promptKey(k uv.KeyPressEvent) {
+	switch {
+	case k.MatchString("enter"):
+		p, v := u.prompt, strings.TrimSpace(string(u.input))
+		u.closePrompt()
+		p.onSubmit(v)
+	case k.MatchString("esc"), k.MatchString("backspace") && len(u.input) == 0:
+		u.closePrompt()
+	default:
+		u.edit(k)
+	}
+}
+
+// command runs a ":" command line.
+func (u *UI) command(line string) {
+	name, arg, _ := strings.Cut(line, " ")
+	arg = strings.TrimSpace(arg)
+	s := u.session()
+	switch name {
+	case "":
+		return
+	case "q", "q!", "qa", "qa!", "quit", "wq", "x":
+		u.quit = true
+		return
+	case "e", "edit", "new":
+		if arg == "" {
+			if r, _, _ := u.selRow(); r.project != "" {
+				arg = r.project
+			} else {
+				arg = u.app.launched
+			}
+		}
+		u.newSessionAt(arg)
+		return
+	case "archived":
+		u.showArchived, u.sel = !u.showArchived, ""
+		return
+	}
+	if s == nil {
+		u.app.notice = "no session"
+		return
+	}
+	n, nerr := strconv.Atoi(arg)
+	switch name {
+	case "rename":
+		if arg != "" {
+			u.app.rename(s, arg)
+		}
+	case "model":
+		if arg != "" {
+			u.app.setModel(s, arg)
+		}
+	case "effort":
+		if indexStr(efforts, arg) < 0 {
+			u.app.notice = "effort: low|medium|high|xhigh|max"
+			return
+		}
+		u.app.setEffort(s, arg)
+	case "mode":
+		if indexStr(modes, arg) < 0 {
+			u.app.notice = "mode: " + strings.Join(modes, "|")
+			return
+		}
+		u.app.setMode(s, arg)
+	case "rewind":
+		if nerr != nil {
+			u.app.notice = "usage: :rewind <turn number>"
+			return
+		}
+		u.rewind(s, n)
+	case "task":
+		if ns, err := u.app.acceptChip(s, n-1); err != nil {
+			u.app.notice = err.Error()
+		} else {
+			u.app.notice = "started task in background: " + ns.Title
+		}
+	case "dismiss":
+		u.app.dismissChip(s, n-1)
+	case "unqueue":
+		u.unqueue(s)
+	case "star":
+		s.IsStarred = !s.IsStarred
+		u.app.save(s)
+	case "archive":
+		s.IsArchived = !s.IsArchived
+		u.app.save(s)
+	case "delete":
+		u.confirmDelete(s)
+	default:
+		u.app.notice = "not a command: " + name
+	}
+}
+
+func (u *UI) confirmDelete(s *Session) {
+	u.ask(fmt.Sprintf("Delete %q? [y/N] ", s.Title), "", func(v string) {
+		if strings.EqualFold(v, "y") {
+			if err := u.app.deleteSession(s); err != nil {
+				u.app.notice = err.Error()
+			}
+		}
+	})
+}
+
+func (u *UI) answerQuestion(s *Session, p *Perm, text string) {
+	qs := questions(p)
+	q := qs[len(p.Answers)]
+	ans := text
+	if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(q.options) {
+		ans = q.options[n-1]
+	}
+	p.Answers[q.question] = ans
+	if len(p.Answers) == len(qs) {
+		u.must(u.app.answerPerm(s, true, false))
+	}
+}
+
+func (u *UI) newSessionAt(v string) {
+	if strings.HasPrefix(v, "~") {
+		home, _ := os.UserHomeDir()
+		v = home + v[1:]
+	}
+	abs, err := filepath.Abs(v)
+	if st, serr := os.Stat(abs); err != nil || serr != nil || !st.IsDir() {
+		u.app.notice = "not a folder: " + v
+		return
+	}
+	u.newSessionIn(abs)
+}
+
+func (u *UI) newSessionIn(dir string) {
+	create := func(wt bool) {
+		s := u.app.newSession(dir, wt)
+		u.open(s)
+		u.pane, u.focus, u.showArchived = paneSession, focusInput, false
+		u.ed.startInsert(len(u.ed.text))
+	}
+	if _, err := git(dir, "rev-parse", "--show-toplevel"); err != nil {
+		create(false)
+		return
+	}
+	u.ask("Work in an isolated git worktree? [Y/n] ", "", func(v string) { create(!strings.EqualFold(v, "n")) })
+}
+
+func (u *UI) rewind(s *Session, n int) {
+	targets := rewindTargets(u.app.L(s.SessionID))
+	if n < 1 || n > len(targets) {
+		u.app.notice = fmt.Sprintf("turn must be 1-%d", len(targets))
+		return
+	}
+	id := targets[n-1].UUID
+	u.must(u.app.call(s, map[string]any{"subtype": "rewind_files", "user_message_id": id, "dry_run": true}, func(r map[string]any) {
+		if r["canRewind"] != true {
+			u.app.notice = "cannot rewind: " + str(r["error"])
+			return
+		}
+		files, _ := r["filesChanged"].([]any)
+		u.ask(fmt.Sprintf("Restore %d file(s) (+%v −%v)? [y/N] ", len(files), r["insertions"], r["deletions"]), "", func(v string) {
+			if !strings.EqualFold(v, "y") {
+				return
+			}
+			u.must(u.app.call(s, map[string]any{"subtype": "rewind_files", "user_message_id": id}, func(map[string]any) {
+				l := u.app.L(s.SessionID)
+				l.entries = append(l.entries, Entry{Kind: "info", Text: fmt.Sprintf("— files rewound to before turn %d —", n)})
+			}))
+		})
+	}))
+}
+
+func (u *UI) must(err error) {
+	if err != nil {
+		u.app.notice = err.Error()
+	}
+}
+
+func (u *UI) insertText(s string) {
+	r := []rune(s)
+	u.input = append(u.input[:u.pos], append(r, u.input[u.pos:]...)...)
+	u.pos += len(r)
+}
+
+// edit applies vim insert-mode editing keys to the input buffer.
+func (u *UI) edit(k uv.KeyPressEvent) {
+	switch {
+	case k.MatchString("backspace", "ctrl+h"):
+		if u.pos > 0 {
+			u.input = append(u.input[:u.pos-1], u.input[u.pos:]...)
+			u.pos--
+		}
+	case k.MatchString("ctrl+w"):
+		i := u.pos
+		for i > 0 && u.input[i-1] == ' ' {
+			i--
+		}
+		for i > 0 && u.input[i-1] != ' ' && u.input[i-1] != '\n' {
+			i--
+		}
+		u.input, u.pos = append(u.input[:i], u.input[u.pos:]...), i
+	case k.MatchString("ctrl+u"):
+		u.input, u.pos = u.input[u.pos:], 0
+	case k.MatchString("left"):
+		u.pos = max(0, u.pos-1)
+	case k.MatchString("right"):
+		u.pos = min(len(u.input), u.pos+1)
+	case k.MatchString("home"):
+		u.pos = 0
+	case k.MatchString("end"):
+		u.pos = len(u.input)
+	default:
+		if k.Text != "" && k.Mod&^uv.ModShift == 0 {
+			u.insertText(k.Text)
+		}
+	}
+}
+
+// ---- drawing ----
+
+type span struct {
+	t  string
+	st uv.Style
+}
+
+// line is one screen row of styled spans; bg, when set, fills the rest of the row.
+type line struct {
+	spans  []span
+	bg     color.Color
+	prefix int       // leading marker/indent runes, left out of yanks
+	brk    lineBreak // how a yank joins this row to the one above
+	starts bool      // first row of a transcript entry, for { }
+	deco   bool      // not content: yanks skip it
+	tag    span      // drawn at the row's right edge, outside the text
+	source *string   // raw markdown the row was rendered from: yanks copy it instead
+	block  *string   // markdown chunk the row shows, rendered or raw
+}
+
+func ln(spans ...span) line              { return line{spans: spans} }
+func fg(c color.Color) uv.Style          { return uv.Style{Fg: c} }
+func with(st uv.Style, a uint8) uv.Style { return uv.Style{Fg: st.Fg, Bg: st.Bg, Attrs: st.Attrs | a} }
+
+func (u *UI) put(x, y, w int, text string, st uv.Style) {
+	if w <= 0 {
+		return
+	}
+	u.ctx.SetStyle(st)
+	u.ctx.DrawString(ansi.Truncate(strings.ReplaceAll(text, "\t", "    "), w, "…"), x, y)
+}
+
+func (u *UI) drawLine(x, y, w int, l line) {
+	if l.bg != nil {
+		u.put(x, y, w, strings.Repeat(" ", w), uv.Style{Bg: l.bg})
+	}
+	if n := ansi.StringWidth(l.tag.t); n > 0 {
+		u.put(x+w-n, y, n, l.tag.t, l.tag.st)
+	}
+	for _, s := range l.spans {
+		u.put(x, y, w, s.t, s.st)
+		n := ansi.StringWidth(s.t)
+		x, w = x+n, w-n
+	}
+}
+
+func width(spans []span) int {
+	n := 0
+	for _, s := range spans {
+		n += ansi.StringWidth(s.t)
+	}
+	return n
+}
+
+// wrap lays spans out in width w. The first row starts with first, later rows with
+// blanks as wide as it; rows break at spaces and overlong words are cut.
+func wrap(sp []span, w int, first span, bg color.Color) []line {
+	ind := span{strings.Repeat(" ", ansi.StringWidth(first.t)), first.st}
+	cur, cw := []span{first}, ansi.StringWidth(first.t)
+	soft := false // row began at a wrap, so leading spaces are dropped
+	var out []line
+	brk := breakHard
+	flush := func(next lineBreak) {
+		if n := len(cur); next == breakAtSpace && n > 0 && strings.HasSuffix(cur[n-1].t, " ") {
+			next = breakInWord // the space stayed on the row above
+		}
+		out = append(out, line{spans: cur, bg: bg, prefix: len([]rune(cur[0].t)), brk: brk})
+		cur, cw, soft, brk = []span{ind}, len(ind.t), next != breakHard, next
+	}
+	for _, s := range sp {
+		for i, para := range strings.Split(strings.ReplaceAll(s.t, "\t", "    "), "\n") {
+			if i > 0 {
+				flush(breakHard)
+			}
+			for _, word := range splitWords(para) {
+				ww := ansi.StringWidth(word)
+				if cw+ww > w && cw > len(ind.t) && ww <= w-len(ind.t) { // a word too long for any row is cut in place
+					flush(breakAtSpace)
+				}
+				if word == " " && soft {
+					continue
+				}
+				for cw+ww > w {
+					head := ansi.Truncate(word, w-cw, "")
+					if head == "" {
+						break
+					}
+					cur = append(cur, span{head, s.st})
+					flush(breakInWord)
+					word = ansi.TruncateLeft(word, ansi.StringWidth(head), "")
+					ww = ansi.StringWidth(word)
+				}
+				cur, cw, soft = append(cur, span{word, s.st}), cw+ww, false
+			}
+		}
+	}
+	return append(out, line{spans: cur, bg: bg, prefix: len([]rune(cur[0].t)), brk: brk})
+}
+
+// splitWords splits s into words and single spaces.
+func splitWords(s string) []string {
+	var out []string
+	for s != "" {
+		i := strings.IndexByte(s, ' ')
+		switch {
+		case i < 0:
+			out, s = append(out, s), ""
+		case i == 0:
+			out, s = append(out, " "), s[1:]
+		default:
+			out, s = append(out, s[:i]), s[i:]
+		}
+	}
+	return out
+}
+
+// md styles the markdown the CLI renders inline: headings, **bold**, `code`, fenced blocks.
+// shortcut: no syntax highlighting or tables, add if transcripts lean on them.
+func md(text string, base uv.Style) []span {
+	var out []span
+	fence := false
+	for i, l := range strings.Split(text, "\n") {
+		if i > 0 {
+			out = append(out, span{"\n", base})
+		}
+		switch h := strings.TrimLeft(l, "#"); {
+		case strings.HasPrefix(strings.TrimSpace(l), "```"):
+			fence = !fence
+		case fence:
+			out = append(out, span{l, base})
+		case h != l && strings.HasPrefix(h, " "):
+			out = append(out, inline(h[1:], with(base, uv.AttrBold|uv.AttrItalic))...)
+		default:
+			out = append(out, inline(l, base)...)
+		}
+	}
+	return out
+}
+
+func inline(l string, st uv.Style) []span {
+	var out []span
+	for {
+		i := strings.IndexAny(l, "`*")
+		if i < 0 {
+			break
+		}
+		mark, inner := "`", uv.Style{Fg: th.permission, Bg: st.Bg, Attrs: st.Attrs}
+		if l[i] == '*' {
+			if !strings.HasPrefix(l[i:], "**") {
+				out, l = append(out, span{l[:i+1], st}), l[i+1:]
+				continue
+			}
+			mark, inner = "**", with(st, uv.AttrBold)
+		}
+		j := strings.Index(l[i+len(mark):], mark)
+		if j < 0 {
+			break
+		}
+		out = append(out, span{l[:i], st})
+		if mark == "**" { // bold may wrap `code`
+			out = append(out, inline(l[i+2:i+2+j], inner)...)
+		} else {
+			out = append(out, span{l[i+1 : i+1+j], inner})
+		}
+		l = l[i+2*len(mark)+j:]
+	}
+	return append(out, span{l, st})
+}
+
+func (u *UI) modeName() string {
+	switch {
+	case u.pane != paneSession:
+		return "NORMAL"
+	case u.focus == focusInput && u.ed.mode == modeInsert:
+		return "INSERT"
+	case u.focus == focusInput:
+		return "NORMAL"
+	case u.tv.visual == visualChar:
+		return "VISUAL"
+	case u.tv.visual == visualLine:
+		return "VISUAL LINE"
+	}
+	return "VIEW"
+}
+
+// rawMarkdown shows replies unrendered while selecting, so a selection copies exactly what it covers.
+func (u *UI) rawMarkdown() bool {
+	return u.pane == paneSession && u.focus == focusView && u.tv.visual != visualOff
+}
+
+func (u *UI) searching() bool {
+	return u.pane == paneSession && u.focus == focusView && u.tv.search.typing
+}
+
+func (u *UI) draw() {
+	scr := u.scr
+	screen.Clear(scr)
+	W, H := scr.Width(), scr.Height()
+	if W < 40 || H < 10 {
+		u.put(0, 0, W, "terminal too small", fg(th.error))
+		scr.Render()
+		scr.Flush()
+		return
+	}
+	sw := min(36, W/3)
+	u.drawSidebar(sw, H)
+	for y := 0; y < H; y++ {
+		u.put(sw, y, 1, "│", fg(th.subtle))
+	}
+	x, w := sw+2, W-sw-3
+	scr.HideCursor()
+	s := u.session()
+	var l *Live
+	if s != nil {
+		u.app.ensureLoaded(s)
+		l = u.app.L(s.SessionID)
+	}
+	bottom, cy, cx := u.bottom(s, l, w)
+	top := H - len(bottom)
+	for i, b := range bottom {
+		u.drawLine(x, top+i, w, b)
+	}
+	if cy >= 0 {
+		scr.SetCursorPosition(min(x+w-1, x+cx), top+cy)
+		scr.ShowCursor()
+	}
+	shape := uv.CursorBlock
+	if u.modeName() == "INSERT" || u.prompt != nil || u.searching() {
+		shape = uv.CursorBar
+	}
+	scr.SetCursorStyle(shape, false)
+	if s == nil {
+		u.put(x, 1, w, "No sessions. Press o to start one, or :e <folder>.", fg(th.inactive))
+	} else {
+		lines := u.transcript(s, l, w)
+		old := u.slines
+		u.slines, u.view = screenLines(lines), max(1, top-1)
+		if raw := u.rawMarkdown(); raw != u.raw { // replies reflowed: keep the cursor on what it was on
+			u.raw = raw
+			was := u.tv.cursor.line
+			u.tv.cursor, u.tv.anchor = remap(u.tv.cursor, old, u.slines), remap(u.tv.anchor, old, u.slines)
+			u.tv.scrollTop += u.tv.cursor.line - was
+		}
+		viewing := u.pane == paneSession && u.focus == focusView
+		if viewing {
+			u.tv.clampAndScroll(u.slines, u.view)
+		} else {
+			u.tv.scrollTop = max(0, len(lines)-u.view) // follow the newest output
+		}
+		start := u.tv.scrollTop
+		for i := 0; i < u.view && start+i < len(lines); i++ {
+			u.drawLine(x, i, w, lines[start+i])
+		}
+		if viewing {
+			u.drawViewMarks(x, start, cy < 0)
+		}
+	}
+	scr.Render()
+	scr.Flush()
+	// a frame that only moves the cursor needs a second pass to show it (grimalkin's present)
+	scr.Render()
+	scr.Flush()
+}
+
+// drawViewMarks reverses the visual selection and search matches, and puts the
+// terminal cursor on the transcript cursor.
+func (u *UI) drawViewMarks(x, start int, showCursor bool) {
+	vs, ve := u.tv.selection()
+	pat := u.tv.search.pattern
+	for i := 0; i < u.view && start+i < len(u.slines); i++ {
+		li, cells := start+i, u.slines[start+i].cells
+		hit := make([]bool, len(cells))
+		if u.tv.visual != visualOff && li >= vs.line && li <= ve.line {
+			from, to := 0, len(cells)-1
+			if li == vs.line {
+				from = vs.col
+			}
+			if li == ve.line && ve.col != endOfLine {
+				to = min(to, ve.col)
+			}
+			for c := from; c <= to; c++ {
+				hit[c] = true
+			}
+		}
+		for _, m := range matchStarts(cells, pat, ignoresCase(pat)) {
+			for c := m; c < m+len(pat); c++ {
+				hit[c] = true
+			}
+		}
+		cx := x
+		for c, ce := range cells {
+			if cell := u.scr.CellAt(cx, i); hit[c] && cell != nil {
+				rev := *cell
+				rev.Style.Attrs |= uv.AttrReverse
+				u.scr.SetCell(cx, i, &rev)
+			}
+			cx += ansi.StringWidth(string(ce.char))
+		}
+	}
+	if c := u.tv.cursor; showCursor && c.line >= start && c.line < start+u.view && c.line < len(u.slines) {
+		cells := u.slines[c.line].cells
+		cx := x
+		for _, ce := range cells[:min(c.col, len(cells))] {
+			cx += ansi.StringWidth(string(ce.char))
+		}
+		u.scr.SetCursorPosition(cx, c.line-start)
+		u.scr.ShowCursor()
+	}
+}
+
+// screenLines gives the view each row's text and the breaks yanks rejoin it by.
+func screenLines(lines []line) []screenLine {
+	out := make([]screenLine, len(lines))
+	for i, l := range lines {
+		sl := screenLine{prefixLen: l.prefix, breakBefore: l.brk, startsEntry: l.starts, decoration: l.deco, source: l.source, block: l.block}
+		for _, sp := range l.spans {
+			for _, r := range sp.t {
+				sl.cells = append(sl.cells, cell{r})
+			}
+		}
+		out[i] = sl
+	}
+	return out
+}
+
+func (u *UI) drawSidebar(w, h int) {
+	title := "Projects"
+	if u.showArchived {
+		title = "Archived"
+	}
+	u.put(1, 0, w-1, title, uv.Style{Attrs: uv.AttrBold})
+	_, si, rs := u.selRow()
+	top := max(0, si-(h-3)) // keep the selection in view
+	y := 2
+	for i := top; i < len(rs) && y < h; i, y = i+1, y+1 {
+		r := rs[i]
+		sel := i == si
+		caret, st := "  ", uv.Style{}
+		if sel && u.pane == paneSidebar {
+			caret, st = "❯ ", fg(th.permission)
+		} else if sel {
+			st = uv.Style{Attrs: uv.AttrBold}
+		}
+		u.put(0, y, 2, caret, fg(th.permission))
+		if r.s == nil {
+			fold := "▾ "
+			if u.collapsed[r.project] {
+				fold = "▸ "
+			}
+			u.drawLine(2, y, w-2, ln(span{fold + filepath.Base(r.project), with(st, uv.AttrBold)},
+				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.inactive)}))
+			continue
+		}
+		glyph, gst := " ", uv.Style{}
+		switch u.app.status(r.s) {
+		case "running":
+			glyph, gst = spinnerFrame(u.app.L(r.s.SessionID).started), fg(th.claude)
+		case "waiting":
+			glyph, gst = "?", fg(th.permission)
+		case "error":
+			glyph, gst = "✗", fg(th.error)
+		}
+		star := "  "
+		if r.s.IsStarred {
+			star = "★ "
+		}
+		t := r.s.Title
+		if t == "" {
+			t = "New session"
+		}
+		branch := ""
+		if r.s.Branch != "" {
+			branch = "  ⎇ " + strings.TrimPrefix(r.s.Branch, "claude/")
+		}
+		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{t, st}, span{branch, fg(th.inactive)}))
+	}
+}
+
+func spinnerFrame(start time.Time) string {
+	n := len(spinnerFrames)
+	i := int(time.Since(start)/(120*time.Millisecond)) % (2*n - 2)
+	if i >= n {
+		i = 2*n - 2 - i
+	}
+	return spinnerFrames[i]
+}
+
+// logo is the CLI's welcome header: Clawd, version, model and where the session runs.
+func logo(s *Session, l *Live) []line {
+	cl, body, dim := fg(th.claude), uv.Style{Fg: th.claude, Bg: th.logoBg}, fg(th.inactive)
+	ver := ""
+	if l.version != "" {
+		ver = " v" + l.version
+	}
+	model := cmp.Or(s.Model, l.model, "default model")
+	return []line{
+		ln(span{" ▐", cl}, span{"▛███▛█", body}, span{"   ", uv.Style{}}, span{"Claude Code", uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
+		ln(span{"▝▜", cl}, span{"█████", body}, span{"█▀", cl}, span{"  ", uv.Style{}}, span{model, dim}),
+		ln(span{" ▝▝   ▝▝ ", cl}, span{"  ", uv.Style{}}, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
+	}
+}
+
+func (u *UI) transcript(s *Session, l *Live, w int) []line {
+	lines := logo(s, l)
+	for i := range lines {
+		lines[i].deco = true
+	}
+	results, tools := map[string]Entry{}, map[string]bool{}
+	for _, e := range l.entries {
+		switch {
+		case e.ID == "":
+		case e.Kind == "result":
+			results[e.ID] = e
+		case e.Kind == "tool":
+			tools[e.ID] = true
+		}
+	}
+	dim := fg(th.inactive)
+	turn := 0
+	for _, e := range l.entries {
+		if e.Kind == "result" && tools[e.ID] {
+			continue // drawn under its tool call
+		}
+		if e.Kind != "result" {
+			lines = append(lines, line{})
+		}
+		first := len(lines)
+		switch e.Kind {
+		case "user":
+			bg := th.userBg
+			ls := wrap(md(e.Text, uv.Style{Fg: th.text, Bg: bg}), w-5, span{"❯ ", uv.Style{Fg: th.inactive, Bg: bg}}, bg)
+			if e.UUID != "" { // turn number for :rewind
+				turn++
+				ls[0].tag = span{fmt.Sprintf("%d ", turn), uv.Style{Fg: th.inactive, Bg: bg}}
+			}
+			lines = append(lines, ls...)
+		case "assistant":
+			lines = append(lines, markdown(e.Text, w, u.rawMarkdown())...)
+		case "tool":
+			r, done := results[e.ID]
+			dot := th.inactive
+			if done && r.Err {
+				dot = th.error
+			} else if done {
+				dot = th.success
+			}
+			name, args, _ := strings.Cut(e.Text, "(")
+			lines = append(lines, wrap([]span{{name, uv.Style{Attrs: uv.AttrBold}}, {"(" + args, uv.Style{}}}, w, span{"⏺ ", fg(dot)}, nil)...)
+			if done {
+				lines = append(lines, resultLines(r, w)...)
+			}
+		case "result":
+			lines = append(lines, resultLines(e, w)...)
+		case "interrupt":
+			lines = append(lines, ln(span{"  ⎿  ", dim}, span{"Interrupted", fg(th.error)}, span{" · What should Claude do instead?", dim}))
+		case "error":
+			lines = append(lines, wrap([]span{{e.Text, fg(th.error)}}, w, span{"  ⎿  ", dim}, nil)...)
+		default:
+			lines = append(lines, wrap([]span{{e.Text, dim}}, w, span{}, nil)...)
+		}
+		if first < len(lines) {
+			lines[first].starts = true
+		}
+	}
+	if l.running && len(l.perms) == 0 {
+		cl := fg(th.claude)
+		spin := ln(span{spinnerFrame(l.started) + " ", cl}, span{l.verb + "…", cl},
+			span{" (" + fmtDur(time.Since(l.started)) + " · ctrl+c to interrupt)", dim})
+		spin.deco = true
+		lines = append(lines, line{}, spin)
+	}
+	return lines
+}
+
+func resultLines(e Entry, w int) []line {
+	st := uv.Style{}
+	if e.Err {
+		st = fg(th.error)
+	}
+	text := e.Text
+	if text == "" {
+		text = "(No content)"
+	}
+	return wrap([]span{{text, st}}, w, span{"  ⎿  ", fg(th.inactive)}, nil)
+}
+
+// bottom builds everything under the transcript: task chips, queued messages, the
+// permission dialog or prompt box, and the footer. It returns the cursor row and
+// column within those lines, row -1 when the cursor is hidden.
+func (u *UI) bottom(s *Session, l *Live, w int) ([]line, int, int) {
+	dim := fg(th.inactive)
+	var out []line
+	cy, cx := -1, 0
+	if s != nil {
+		for i, c := range l.chips {
+			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.suggestion)}, nil)...)
+		}
+		if len(l.chips) > 0 {
+			out = append(out, ln(span{"  :task <n> to start · :dismiss <n>", dim}))
+		}
+		for _, q := range l.queued {
+			out = append(out, wrap([]span{{q.Text, dim}}, w, span{"❯ ", dim}, nil)...)
+		}
+		if len(l.queued) > 0 {
+			out = append(out, ln(span{"  queued · Claude reads it at its next step · x pulls the last one back", dim}))
+		}
+		if len(l.perms) > 0 {
+			out = append(out, u.permLines(l.perms[0], w)...)
+		}
+	}
+	if s != nil && (len(l.perms) == 0 || l.perms[0].Answers != nil) {
+		if s.Effort != "" {
+			e := effortGlyphs[s.Effort] + " " + s.Effort + " · :effort"
+			out = append(out, ln(span{strings.Repeat(" ", max(0, w-ansi.StringWidth(e))), uv.Style{}}, span{e, dim}))
+		}
+		rule := ln(span{strings.Repeat("─", w), fg(th.promptBorder)})
+		out = append(out, rule)
+		text := u.ed.text
+		caret := uv.Style{}
+		if l.running {
+			caret = dim
+		}
+		// at most 6 rows show; the window follows the cursor
+		rows := inputRows(text, w-2)
+		x, y := cursorXY(text[:min(u.ed.cursor, len(text))], w-2)
+		u.ed.scrollRow = min(clamp(u.ed.scrollRow, max(0, y-5), y), max(0, len(rows)-6))
+		rows = rows[u.ed.scrollRow:min(len(rows), u.ed.scrollRow+6)]
+		if u.pane == paneSession && u.focus == focusInput && u.prompt == nil {
+			cy, cx = len(out)+y-u.ed.scrollRow, 2+x
+		}
+		for i, r := range rows {
+			p := "  "
+			if i == 0 && u.ed.scrollRow == 0 {
+				p = "❯ "
+			}
+			st := uv.Style{}
+			if len(text) == 0 {
+				r, st = `Try "how does <filepath> work?"`, uv.Style{Attrs: uv.AttrFaint}
+			}
+			out = append(out, ln(span{p, caret}, span{r, st}))
+		}
+		out = append(out, rule)
+	}
+	foot := u.footer(s, w)
+	switch {
+	case u.prompt != nil:
+		cy, cx = len(out), 2+ansi.StringWidth(u.prompt.label+string(u.input[:u.pos]))
+	case u.searching():
+		cy, cx = len(out), 3+ansi.StringWidth(string(u.tv.search.typed))
+	}
+	return append(out, foot...), cy, cx
+}
+
+// inputRows hard-wraps the prompt the same way cursorXY counts, so the cursor lands on its character.
+func inputRows(text []rune, w int) []string {
+	rows, cur, x := []string{}, []rune{}, 0
+	for _, r := range text {
+		rw := ansi.StringWidth(string(r))
+		if r == '\n' || x+rw > w {
+			rows, cur, x = append(rows, string(cur)), nil, 0
+			if r == '\n' {
+				continue
+			}
+		}
+		cur, x = append(cur, r), x+rw
+	}
+	return append(rows, string(cur))
+}
+
+func (u *UI) footer(s *Session, w int) []line {
+	dim := fg(th.inactive)
+	switch {
+	case u.prompt != nil:
+		return []line{ln(span{"  " + u.prompt.label + string(u.input), uv.Style{Attrs: uv.AttrBold}})}
+	case u.searching():
+		dir := "/"
+		if u.tv.search.typedBackward {
+			dir = "?"
+		}
+		return []line{ln(span{"  " + dir + string(u.tv.search.typed), uv.Style{Attrs: uv.AttrBold}})}
+	}
+	vim := "-- " + u.modeName() + " --"
+	left := []span{{"  ", uv.Style{}}, {vim, dim}}
+	cycle := span{" (shift+tab to cycle)", dim}
+	if s != nil {
+		switch s.PermissionMode {
+		case "acceptEdits":
+			left = append(left, span{" ⏵⏵ accept edits on", fg(th.autoAccept)}, cycle)
+		case "plan":
+			left = append(left, span{" ⏸ plan mode on", fg(th.planMode)}, cycle)
+		case "auto":
+			left = append(left, span{" ⏵⏵ auto mode on", fg(th.warning)}, cycle)
+		default:
+			left = append(left, span{" ⏸ manual mode on", dim})
+		}
+	}
+	if vim == "-- NORMAL --" {
+		left = append(left, span{" · ? for shortcuts", dim})
+	}
+	out := []line{ln(left...)}
+	if n := u.app.notice; n != "" {
+		if pad := w - width(left) - ansi.StringWidth(n); pad >= 2 {
+			out[0].spans = append(out[0].spans, span{strings.Repeat(" ", pad), uv.Style{}}, span{n, fg(th.warning)})
+		} else {
+			out = append(out, wrap([]span{{n, fg(th.warning)}}, w, span{"  ", uv.Style{}}, nil)...)
+		}
+	}
+	if u.help {
+		help := "j/k move · l open · h project · za fold · o new · r rename · s star · a archive · dd delete · A archived · :q quit"
+		if u.pane == paneSession {
+			help = "INSERT  enter send/queue · ctrl+s interrupt+send · ctrl+j newline · esc → NORMAL\n" +
+				"NORMAL  h j k l w b e 0 ^ $ · d c y + motion, dd cc yy · x X r D C · o O p P u · enter send · i a I A · k on top line → VIEW · esc interrupt\n" +
+				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
+				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt\n" +
+				"        ctrl+h list · :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
+		}
+		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
+	}
+	return out
+}
+
+func branchSuffix(s *Session) string {
+	if s.Branch != "" {
+		return " ⎇ " + s.Branch
+	}
+	return ""
+}
+
+type question struct {
+	question string
+	options  []string
+}
+
+func questions(p *Perm) []question {
+	var out []question
+	qs, _ := p.Input["questions"].([]any)
+	for _, q := range qs {
+		qm, _ := q.(map[string]any)
+		var opts []string
+		os, _ := qm["options"].([]any)
+		for _, o := range os {
+			om, _ := o.(map[string]any)
+			opts = append(opts, str(om["label"]))
+		}
+		out = append(out, question{str(qm["question"]), opts})
+	}
+	return out
+}
+
+// permOption is one choice in the permission dialog.
+type permOption struct {
+	label         string
+	allow, always bool
+}
+
+func permOptions(p *Perm) []permOption {
+	opts := []permOption{{"Yes", true, false}}
+	if len(p.Suggestions) > 0 {
+		opts = append(opts, permOption{alwaysLabel(p.Suggestions[0]), true, true})
+	}
+	return append(opts, permOption{"No", false, false})
+}
+
+// alwaysLabel words the CLI's "don't ask again" choice for a permission suggestion.
+func alwaysLabel(sug any) string {
+	m, _ := sug.(map[string]any)
+	switch m["type"] {
+	case "addRules":
+		var rules []string
+		rs, _ := m["rules"].([]any)
+		for _, r := range rs {
+			rm, _ := r.(map[string]any)
+			rules = append(rules, cmp.Or(str(rm["ruleContent"]), str(rm["toolName"])))
+		}
+		return "Yes, and don’t ask again for: " + strings.Join(rules, ", ")
+	case "setMode":
+		if m["mode"] == "acceptEdits" {
+			return "Yes, allow all edits during this session (shift+tab)"
+		}
+	}
+	return "Yes, and don’t ask again"
+}
+
+// permLines draws the CLI-style permission dialog, or an AskUserQuestion card.
+func (u *UI) permLines(p *Perm, w int) []line {
+	dim, perm := fg(th.inactive), fg(th.permission)
+	out := []line{ln(span{strings.Repeat("─", w), perm})}
+	if p.Answers != nil {
+		qs := questions(p)
+		if len(p.Answers) >= len(qs) {
+			return nil
+		}
+		q := qs[len(p.Answers)]
+		out = append(out, wrap([]span{{q.question, uv.Style{Attrs: uv.AttrBold}}}, w, span{fmt.Sprintf(" (%d/%d) ", len(p.Answers)+1, len(qs)), dim}, nil)...)
+		for i, o := range q.options {
+			out = append(out, ln(span{fmt.Sprintf("   %d. ", i+1), dim}, span{o, uv.Style{}}))
+		}
+		return append(out, line{}, ln(span{" i, then type a number or your own answer · enter to submit", dim}))
+	}
+	title, body := p.Tool, summariseInput(p.Input)
+	switch p.Tool {
+	case "Bash":
+		title, body = "Bash command", firstLines(str(p.Input["command"]), 8)
+	case "Edit", "MultiEdit", "NotebookEdit":
+		title = "Edit file"
+	case "Write":
+		title = "Create file"
+	case "Read":
+		title = "Read file"
+	case "ExitPlanMode":
+		title, body = "Ready to code?", firstLines(str(p.Input["plan"]), 12)
+	}
+	out = append(out, ln(span{" " + title, with(perm, uv.AttrBold)}))
+	if d := str(p.Input["description"]); d != "" {
+		out = append(out, wrap([]span{{d, dim}}, w, span{" ", uv.Style{}}, nil)...)
+	}
+	dash := ln(span{strings.Repeat("╌", w), fg(th.subtle)})
+	out = append(out, dash)
+	out = append(out, wrap([]span{{body, uv.Style{}}}, w, span{" ", uv.Style{}}, nil)...)
+	out = append(out, dash, line{}, ln(span{" Do you want to proceed?", uv.Style{}}))
+	for i, o := range permOptions(p) {
+		caret, st := "   ", uv.Style{}
+		if i == u.permSel {
+			caret, st = " ❯ ", perm
+		}
+		out = append(out, ln(span{caret, perm}, span{fmt.Sprintf("%d. ", i+1), dim}, span{o.label, st}))
+	}
+	return append(out, line{}, ln(span{" Esc to cancel", dim}))
+}
+
+// cursorXY maps a cursor offset to a position inside the wrapped input box.
+func cursorXY(before []rune, w int) (int, int) {
+	x, y := 0, 0
+	for _, r := range before {
+		if r == '\n' {
+			x, y = 0, y+1
+			continue
+		}
+		rw := ansi.StringWidth(string(r))
+		if x+rw > w {
+			x, y = 0, y+1
+		}
+		x += rw
+	}
+	return x, y
+}
+
+func indexStr(xs []string, s string) int {
+	for i, x := range xs {
+		if x == s {
+			return i
+		}
+	}
+	return -1
+}
