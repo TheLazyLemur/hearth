@@ -99,3 +99,104 @@ func TestQueuedMessageJoinsTranscriptWhenConsumedOrComesBackWhenCancelled(t *tes
 		t.Fatalf("queued %+v pulled %q entries %+v", l.Queued, pulled, l.Entries)
 	}
 }
+
+func TestSessionRunsOnTheBackendChosenBeforeItStarts(t *testing.T) {
+	// given
+	// ... a new session switched to pi before its first message
+	a, f := testApp(t)
+	s := a.NewSession("/tmp", false)
+	chosen := a.SetBackend(s, "pi")
+
+	// when
+	// ... the first message starts it, then the user tries to switch back
+	sendErr := a.Send(s, "hi")
+	switchErr := a.SetBackend(s, DefaultBackend)
+
+	// then
+	// ... pi ran it, and the backend stays pi once started
+	if chosen != nil || sendErr != nil || switchErr == nil || s.Backend != "pi" || f.store.saved[s.SessionID].Backend != "pi" ||
+		len(f.piLauncher.agents) != 1 || len(f.launcher.agents) != 0 {
+		t.Fatalf("chosen %v send %v switch %v session %+v", chosen, sendErr, switchErr, s)
+	}
+}
+
+func TestBackendRefusesFeaturesItLacks(t *testing.T) {
+	// given
+	// ... a running pi session with a queued message
+	a, _ := testApp(t)
+	s := a.NewSession("/tmp", false)
+	a.SetBackend(s, "pi")
+	ag := withAgent(a, s)
+	a.Send(s, "hi")
+
+	// when
+	// ... the user rewinds and pulls the message back
+	rewindErr := a.PreviewRewind(s, 1, func(RewindPreview) {})
+	unqueueErr := a.Unqueue(s, func(string) {})
+
+	// then
+	// ... each is refused before reaching the agent
+	if rewindErr == nil || unqueueErr == nil || len(ag.requests) != 0 {
+		t.Fatalf("rewind %v unqueue %v requests %v", rewindErr, unqueueErr, ag.requests)
+	}
+}
+
+func TestSessionsSavedBeforeBackendsRunOnTheDefault(t *testing.T) {
+	// given
+	// ... a stored session with no backend recorded
+	old := &Session{SessionID: "local_old", Cwd: "/tmp", PermissionMode: "default"}
+
+	// when
+	// ... the app loads it and the user messages it
+	a, f := testApp(t, old)
+	err := a.Send(old, "hi")
+
+	// then
+	// ... it runs on the default backend
+	if err != nil || old.Backend != DefaultBackend || a.Backend(old).Label != "Claude Code" || len(f.launcher.agents) != 1 {
+		t.Fatalf("err %v session %+v", err, old)
+	}
+}
+
+func TestModelsAreListedOncePerBackendInTheBackground(t *testing.T) {
+	// given
+	// ... two pi sessions and a pi that offers one model
+	a, f := testApp(t)
+	f.piLauncher.models = []Model{{ID: "ollama/deepseek-v4.1-flash:cloud", Name: "DeepSeek V4.1 Flash", Efforts: []string{"off", "high"}}}
+	s1, s2 := a.NewSession("/tmp", false), a.NewSession("/tmp", false)
+	a.SetBackend(s1, "pi")
+	a.SetBackend(s2, "pi")
+
+	// when
+	// ... the first session asks for models, the listing arrives, and the second asks too
+	_, loading := a.Models(s1)
+	a.Handle(<-a.Events())
+	ms, stillLoading := a.Models(s2)
+
+	// then
+	// ... the first ask is loading, the second gets the cached list without listing again
+	if !loading || stillLoading || !reflect.DeepEqual(ms, f.piLauncher.models) || f.piLauncher.lists != 1 || f.launcher.lists != 0 {
+		t.Fatalf("loading %v %v models %+v lists %d", loading, stillLoading, ms, f.piLauncher.lists)
+	}
+}
+
+func TestEffortsFollowTheSessionsModel(t *testing.T) {
+	// given
+	// ... a pi session on a listed model
+	a, f := testApp(t)
+	f.piLauncher.models = []Model{{ID: "ollama/a", Efforts: []string{"off", "high"}}, {ID: "ollama/b"}}
+	s := a.NewSession("/tmp", false)
+	a.SetBackend(s, "pi")
+	a.Models(s)
+	a.Handle(<-a.Events())
+
+	// when
+	// ... the session picks model a
+	a.SetModel(s, "ollama/a")
+
+	// then
+	// ... its effort levels are model a's
+	if got := a.Efforts(s); !reflect.DeepEqual(got, []string{"off", "high"}) {
+		t.Fatalf("efforts %v", got)
+	}
+}

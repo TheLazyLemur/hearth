@@ -7,9 +7,12 @@ import (
 	"testing"
 )
 
-type fakeStore struct{ saved map[string]Session }
+type fakeStore struct {
+	loaded []*Session
+	saved  map[string]Session
+}
 
-func (f *fakeStore) Load() ([]*Session, error) { return nil, nil }
+func (f *fakeStore) Load() ([]*Session, error) { return f.loaded, nil }
 func (f *fakeStore) Save(s *Session) error     { f.saved[s.SessionID] = *s; return nil }
 func (f *fakeStore) Delete(id string) error {
 	if _, ok := f.saved[id]; !ok {
@@ -35,7 +38,13 @@ func (f *fakeWorktrees) Create(originCwd, prompt string) (Worktree, error) {
 }
 func (f *fakeWorktrees) Remove(originCwd, path string) error { return f.removeErr }
 
-type fakeLauncher struct{ agents []*fakeAgent }
+type fakeLauncher struct {
+	agents []*fakeAgent
+	models []Model
+	lists  int // Models calls
+}
+
+func (f *fakeLauncher) Models(cwd string) ([]Model, error) { f.lists++; return f.models, nil }
 
 func (f *fakeLauncher) Start(s *Session, out chan<- AgentEvent) (Agent, error) {
 	ag := &fakeAgent{}
@@ -79,15 +88,19 @@ func (f *fakeAgent) Deny(requestID, message string) error { return nil }
 func (f *fakeAgent) Close()                               {}
 
 type fakes struct {
-	store     *fakeStore
-	worktrees *fakeWorktrees
-	launcher  *fakeLauncher
+	store      *fakeStore
+	worktrees  *fakeWorktrees
+	launcher   *fakeLauncher // the default backend's
+	piLauncher *fakeLauncher // a backend without rewind or unqueue
 }
 
-func testApp(t *testing.T) (*App, fakes) {
+func testApp(t *testing.T, loaded ...*Session) (*App, fakes) {
 	t.Helper()
-	f := fakes{&fakeStore{saved: map[string]Session{}}, &fakeWorktrees{}, &fakeLauncher{}}
-	a, err := NewApp(f.store, fakeTranscripts{}, f.launcher, f.worktrees)
+	f := fakes{&fakeStore{loaded: loaded, saved: map[string]Session{}}, &fakeWorktrees{}, &fakeLauncher{}, &fakeLauncher{}}
+	a, err := NewApp(f.store, map[string]Backend{
+		DefaultBackend: {Label: "Claude Code", Launcher: f.launcher, Transcripts: fakeTranscripts{}, Rewind: true, Unqueue: true},
+		"pi":           {Label: "pi", Launcher: f.piLauncher, Transcripts: fakeTranscripts{}},
+	}, f.worktrees)
 	if err != nil {
 		t.Fatal(err)
 	}

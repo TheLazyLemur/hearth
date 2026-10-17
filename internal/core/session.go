@@ -12,6 +12,7 @@ import (
 type Session struct {
 	SessionID      string       `json:"sessionId"`
 	CLISessionID   string       `json:"cliSessionId,omitempty"`
+	Backend        string       `json:"backend,omitempty"` // a key of the App's backends
 	Cwd            string       `json:"cwd"`
 	OriginCwd      string       `json:"originCwd"`
 	Title          string       `json:"title"`
@@ -53,6 +54,7 @@ type Perm struct {
 	Tool        string
 	Input       map[string]any
 	Suggestions []any
+	Reason      string         // why it asks, when a classifier flagged the call
 	Answers     map[string]any // AskUserQuestion: question text -> answer
 }
 

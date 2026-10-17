@@ -25,12 +25,31 @@ type Worktrees interface {
 	Remove(originCwd, path string) error
 }
 
+// Backend is an agent harness a session can run on, and which optional features it has.
+type Backend struct {
+	Label           string // e.g. "Claude Code"
+	Launcher        Launcher
+	Transcripts     Transcripts
+	Rewind, Unqueue bool
+}
+
+// DefaultBackend runs new sessions, and the sessions saved before there was a choice.
+const DefaultBackend = "claude"
+
 // Launcher starts an agent for s; the agent reports on out until it sends Exited.
 type Launcher interface {
 	Start(s *Session, out chan<- AgentEvent) (Agent, error)
+	// Models lists the models an agent started in cwd offers. It blocks while it asks one.
+	Models(cwd string) ([]Model, error)
 }
 
-// Agent is one running Claude Code. Methods returning a string send a request
+// Model is one model a backend offers; ID is what SetModel takes.
+type Model struct {
+	ID, Name, Description string
+	Efforts               []string // effort levels it accepts, none when it has no effort setting
+}
+
+// Agent is one running agent process. Methods returning a string send a request
 // whose Reply arrives later as an event carrying that request id.
 type Agent interface {
 	// SendUser may be called mid-turn: the agent queues the message and reports
@@ -91,6 +110,12 @@ type (
 		Rewind    RewindPreview
 	}
 	Exited struct{ Err error }
+	// ModelsListed carries a backend's model list, fetched for the session that asked.
+	ModelsListed struct {
+		Backend string
+		Models  []Model
+		Err     error
+	}
 )
 
 func (Initialized) event()         {}
@@ -106,3 +131,4 @@ func (TaskSuggested) event()       {}
 func (TaskDismissed) event()       {}
 func (Reply) event()               {}
 func (Exited) event()              {}
+func (ModelsListed) event()        {}

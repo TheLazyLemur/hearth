@@ -163,7 +163,8 @@ func TestGrepHitOpensTheSessionWithTheCursorOnTheMatch(t *testing.T) {
 	s := &core.Session{SessionID: "local_1", CLISessionID: "c1", Title: "render", OriginCwd: "/p"}
 	es := []core.Entry{{Kind: "user", Text: "add markdown", UUID: "u1"}, {Kind: "tool", Text: "Bash(grep glamour)", ID: "t1"},
 		{Kind: "result", Text: "glamour v2", ID: "t1"}, {Kind: "assistant", Text: strings.Repeat("filler\n\n", 5) + "Rendered with **glamour** now."}}
-	app, err := core.NewApp(fakeStore{[]*core.Session{s}}, fakeTranscripts{"c1": es}, nil, nil)
+	app, err := core.NewApp(fakeStore{[]*core.Session{s}},
+		map[string]core.Backend{core.DefaultBackend: {Label: "Claude Code", Transcripts: fakeTranscripts{"c1": es}}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,5 +189,33 @@ func TestGrepHitOpensTheSessionWithTheCursorOnTheMatch(t *testing.T) {
 	}
 	if u.focus != focusView || string(at) != "glamour" {
 		t.Fatalf("focus %d cursor %+v", u.focus, cur)
+	}
+}
+
+func TestTypedInputPicksAChoice(t *testing.T) {
+	cs := []choice{{"opus", "Opus · Opus 5.5"}, {"ollama/deepseek-v4.1-flash:cloud", "DeepSeek V4.1 Flash · ollama"}, {"haiku", "Haiku · Fastest"}}
+	cases := []struct{ name, typed, want string }{
+		{"number picks that row", "3", "haiku"},
+		{"text picks the first row containing it", "deepseek", "ollama/deepseek-v4.1-flash:cloud"},
+		{"text matches labels case-insensitively", "FAST", "haiku"},
+		{"unmatched text is taken as typed", "anthropic/claude-sonnet-5-5", "anthropic/claude-sonnet-5-5"},
+		{"out of range number is taken as typed", "9", "9"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a model list
+			list := cs
+
+			// when
+			// ... the user submits typed text
+			got := pick(list, c.typed)
+
+			// then
+			// ... it resolves to the matching choice's value
+			if got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
 	}
 }

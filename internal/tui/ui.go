@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,31 @@ const (
 type prompt struct {
 	label    string
 	onSubmit func(string)
+	choices  func() (cs []choice, loading bool) // rows to pick from; nil for free text only
+}
+
+// choice is one row a prompt offers; picking it submits value.
+type choice struct{ value, label string }
+
+func matches(c choice, typed string) bool {
+	t := strings.ToLower(typed)
+	return strings.Contains(strings.ToLower(c.value), t) || strings.Contains(strings.ToLower(c.label), t)
+}
+
+// pick resolves typed against cs: a row number, else the first row containing the text, else the text itself.
+func pick(cs []choice, typed string) string {
+	if n, err := strconv.Atoi(typed); err == nil {
+		if n >= 1 && n <= len(cs) {
+			return cs[n-1].value
+		}
+		return typed
+	}
+	for _, c := range cs {
+		if typed != "" && matches(c, typed) {
+			return c.value
+		}
+	}
+	return typed
 }
 
 // row is one sidebar line: a project header (s == nil) or a session under it.
@@ -183,7 +209,7 @@ func (u *UI) open(s *core.Session) {
 func (u *UI) ask(label, initial string, f func(string)) {
 	u.input = []rune(initial)
 	u.pos = len(u.input)
-	u.prompt = &prompt{label, f}
+	u.prompt = &prompt{label: label, onSubmit: f}
 }
 
 func (u *UI) closePrompt() {
@@ -239,7 +265,7 @@ func (u *UI) key(k uv.KeyPressEvent) {
 		case len(u.app.L(s.SessionID).Perms) > 0 && u.app.L(s.SessionID).Perms[0].Answers == nil:
 			u.cardKey(s, k)
 		case k.MatchString("shift+tab"):
-			u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+			u.cycleMode(s)
 		case u.focus == focusView:
 			u.viewKey(s, k)
 		default:
@@ -264,7 +290,7 @@ func (u *UI) key(k uv.KeyPressEvent) {
 			u.pane = paneSession
 		}
 	case k.MatchString("shift+tab") && s != nil:
-		u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+		u.cycleMode(s)
 	default:
 		u.sidebarKey(seq)
 	}
@@ -395,10 +421,10 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 			u.unqueue(s)
 			return
 		case char == 'm':
-			u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+			u.cycleMode(s)
 			return
 		case char == 'M':
-			u.ask(":", "model "+s.Model, u.command)
+			u.pickModel(s)
 			return
 		case char == 'R':
 			u.ask(":", "rewind ", u.command)
@@ -456,6 +482,63 @@ func (u *UI) submit(s *core.Session, interrupt bool) {
 	u.ed.reset()
 }
 
+// pickModel offers s's backend models; typing filters them, a number or enter picks, unlisted text is taken as an id.
+func (u *UI) pickModel(s *core.Session) {
+	u.ask("model: ", "", func(v string) {
+		if v != "" {
+			u.app.SetModel(s, v)
+		}
+	})
+	u.prompt.choices = func() ([]choice, bool) {
+		ms, loading := u.app.Models(s)
+		current := cmp.Or(s.Model, u.app.L(s.SessionID).Model)
+		cs := make([]choice, len(ms))
+		for i, m := range ms {
+			cs[i] = choice{m.ID, strings.Join(slices.DeleteFunc([]string{m.Name, m.Description}, func(x string) bool { return x == "" }), " · ")}
+			if m.ID == current {
+				cs[i].label += "  (current)"
+			}
+		}
+		return cs, loading
+	}
+}
+
+// choiceLines lists a prompt's rows that match what is typed (all when it's a row number),
+// numbered for picking, with the row enter would take marked.
+func (u *UI) choiceLines() []line {
+	dim := fg(th.inactive)
+	cs, loading := u.prompt.choices()
+	if loading {
+		return []line{ln(span{"  loading models…", dim})}
+	}
+	typed := strings.TrimSpace(string(u.input))
+	_, err := strconv.Atoi(typed)
+	byNumber := err == nil
+	picked, marked := pick(cs, typed), false
+	var out []line
+	for i, c := range cs {
+		if !byNumber && !matches(c, typed) {
+			continue
+		}
+		mark, st := "  ", uv.Style{}
+		if c.value == picked && !marked {
+			mark, st, marked = "❯ ", fg(th.permission), true
+		}
+		out = append(out, ln(span{mark, st}, span{fmt.Sprintf("%d. ", i+1), dim}, span{c.label, st}))
+		if len(out) == 10 {
+			break // shortcut: long lists show their first 10 matches; typing narrows them
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, ln(span{"  no match · enter uses what you typed as the id", dim}))
+	}
+	return out
+}
+
+func (u *UI) cycleMode(s *core.Session) {
+	u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+}
+
 func (u *UI) unqueue(s *core.Session) {
 	u.must(u.app.Unqueue(s, func(text string) {
 		u.ed.text, u.focus = []rune(text), focusInput
@@ -505,6 +588,10 @@ func (u *UI) promptKey(k uv.KeyPressEvent) {
 	case k.MatchString("enter"):
 		p, v := u.prompt, strings.TrimSpace(string(u.input))
 		u.closePrompt()
+		if p.choices != nil {
+			cs, _ := p.choices()
+			v = pick(cs, v)
+		}
 		p.onSubmit(v)
 	case k.MatchString("esc"), k.MatchString("backspace") && len(u.input) == 0:
 		u.closePrompt()
@@ -555,12 +642,18 @@ func (u *UI) command(line string) {
 			u.app.Rename(s, arg)
 		}
 	case "model":
-		if arg != "" {
-			u.app.SetModel(s, arg)
+		if arg == "" {
+			u.pickModel(s)
+			return
 		}
+		u.app.SetModel(s, arg)
 	case "effort":
-		if indexStr(efforts, arg) < 0 {
-			u.app.Notice = "effort: low|medium|high|xhigh|max"
+		valid := u.app.Efforts(s)
+		if valid == nil {
+			valid = efforts[1:]
+		}
+		if arg != "" && indexStr(valid, arg) < 0 {
+			u.app.Notice = "effort: " + strings.Join(valid, "|")
 			return
 		}
 		u.app.SetEffort(s, arg)
@@ -570,6 +663,8 @@ func (u *UI) command(line string) {
 			return
 		}
 		u.app.SetMode(s, arg)
+	case "backend":
+		u.must(u.app.SetBackend(s, arg))
 	case "rewind":
 		if nerr != nil {
 			u.app.Notice = "usage: :rewind <turn number>"
@@ -1076,7 +1171,11 @@ func (u *UI) drawSidebar(w, h int) {
 		if r.s.Branch != "" {
 			branch = "  ⎇ " + strings.TrimPrefix(r.s.Branch, "claude/")
 		}
-		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{t, st}, span{branch, fg(th.inactive)}))
+		tag := "" // before the title, which truncation would cut it from
+		if r.s.Backend != core.DefaultBackend {
+			tag = u.app.Backend(r.s).Label + " "
+		}
+		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.permission)}, span{t, st}, span{branch, fg(th.inactive)}))
 	}
 }
 
@@ -1090,7 +1189,7 @@ func spinnerFrame(start time.Time) string {
 }
 
 // logo is the CLI's welcome header: Clawd, version, model and where the session runs.
-func logo(s *core.Session, l *core.Live) []line {
+func (u *UI) logo(s *core.Session, l *core.Live) []line {
 	cl, body, dim := fg(th.claude), uv.Style{Fg: th.claude, Bg: th.logoBg}, fg(th.inactive)
 	ver := ""
 	if l.Version != "" {
@@ -1098,14 +1197,14 @@ func logo(s *core.Session, l *core.Live) []line {
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
 	return []line{
-		ln(span{" ▐", cl}, span{"▛███▛█", body}, span{"   ", uv.Style{}}, span{"Claude Code", uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
+		ln(span{" ▐", cl}, span{"▛███▛█", body}, span{"   ", uv.Style{}}, span{u.app.Backend(s).Label, uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
 		ln(span{"▝▜", cl}, span{"█████", body}, span{"█▀", cl}, span{"  ", uv.Style{}}, span{model, dim}),
 		ln(span{" ▝▝   ▝▝ ", cl}, span{"  ", uv.Style{}}, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
 	}
 }
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
-	lines := logo(s, l)
+	lines := u.logo(s, l)
 	for i := range lines {
 		lines[i].deco = true
 	}
@@ -1209,7 +1308,11 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 			out = append(out, wrap([]span{{q.Text, dim}}, w, span{"❯ ", dim}, nil)...)
 		}
 		if len(l.Queued) > 0 {
-			out = append(out, ln(span{"  queued · Claude reads it at its next step · x pulls the last one back", dim}))
+			hint := "  queued · " + u.app.Backend(s).Label + " reads it at its next step"
+			if u.app.Backend(s).Unqueue {
+				hint += " · x pulls the last one back"
+			}
+			out = append(out, ln(span{hint, dim}))
 		}
 		if len(l.Perms) > 0 {
 			out = append(out, u.permLines(l.Perms[0], w)...)
@@ -1247,6 +1350,9 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 			out = append(out, ln(span{p, caret}, span{r, st}))
 		}
 		out = append(out, rule)
+	}
+	if u.prompt != nil && u.prompt.choices != nil {
+		out = append(out, u.choiceLines()...)
 	}
 	foot := u.footer(s, w)
 	switch {
@@ -1319,7 +1425,7 @@ func (u *UI) footer(s *core.Session, w int) []line {
 				"NORMAL  h j k l w b e 0 ^ $ · d c y + motion, dd cc yy · x X r D C · o O p P u · enter send · i a I A · k on top line → VIEW · esc interrupt\n" +
 				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
 				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt\n" +
-				"        space space sessions · space / grep · ctrl+h list · :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
+				"        space space sessions · space / grep · ctrl+h list · :backend :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
 		}
 		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
 	}
@@ -1403,7 +1509,11 @@ func (u *UI) permLines(p *core.Perm, w int) []line {
 	dash := ln(span{strings.Repeat("╌", w), fg(th.subtle)})
 	out = append(out, dash)
 	out = append(out, wrap([]span{{body, uv.Style{}}}, w, span{" ", uv.Style{}}, nil)...)
-	out = append(out, dash, line{}, ln(span{" Do you want to proceed?", uv.Style{}}))
+	out = append(out, dash)
+	if p.Reason != "" {
+		out = append(out, wrap([]span{{"Flagged by auto mode: " + p.Reason, fg(th.warning)}}, w, span{" ", uv.Style{}}, nil)...)
+	}
+	out = append(out, line{}, ln(span{" Do you want to proceed?", uv.Style{}}))
 	for i, o := range permOptions(p) {
 		caret, st := "   ", uv.Style{}
 		if i == u.permSel {

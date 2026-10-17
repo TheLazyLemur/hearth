@@ -1,12 +1,16 @@
 package core
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"claude-code-tui/pkg/random"
@@ -32,24 +36,84 @@ type Live struct {
 }
 
 type App struct {
-	store       SessionStore
-	transcripts Transcripts
-	launcher    Launcher
-	worktrees   Worktrees
-	sessions    []*Session
-	live        map[string]*Live
-	events      chan AgentEvent
-	Notice      string
-	now         func() int64
+	store     SessionStore
+	backends  map[string]Backend
+	models    map[string][]Model // by backend, once listed
+	worktrees Worktrees
+	sessions  []*Session
+	live      map[string]*Live
+	events    chan AgentEvent
+	Notice    string
+	now       func() int64
 }
 
-func NewApp(store SessionStore, transcripts Transcripts, launcher Launcher, worktrees Worktrees) (*App, error) {
+// NewApp needs backends to hold DefaultBackend.
+func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees) (*App, error) {
+	if _, ok := backends[DefaultBackend]; !ok {
+		panic("no " + DefaultBackend + " backend")
+	}
 	ss, err := store.Load()
 	if err != nil {
 		return nil, err
 	}
-	return &App{store: store, transcripts: transcripts, launcher: launcher, worktrees: worktrees, sessions: ss,
+	for _, s := range ss {
+		if s.Backend == "" {
+			s.Backend = DefaultBackend
+		}
+		if _, ok := backends[s.Backend]; !ok {
+			return nil, fmt.Errorf("session %s uses unknown backend %q", s.SessionID, s.Backend)
+		}
+	}
+	return &App{store: store, backends: backends, models: map[string][]Model{}, worktrees: worktrees, sessions: ss,
 		live: map[string]*Live{}, events: make(chan AgentEvent, 256), now: func() int64 { return time.Now().UnixMilli() }}, nil
+}
+
+// Backend is the harness s runs on.
+func (a *App) Backend(s *Session) Backend { return a.backends[s.Backend] }
+
+// SetBackend picks the harness for a session that has not started yet.
+func (a *App) SetBackend(s *Session, name string) error {
+	if _, ok := a.backends[name]; !ok {
+		names := slices.Sorted(maps.Keys(a.backends))
+		return fmt.Errorf("backend: %s", strings.Join(names, "|"))
+	}
+	if s.CLISessionID != "" || a.L(s.SessionID).agent != nil {
+		return fmt.Errorf("backend is fixed once the session has started")
+	}
+	s.Backend = name
+	a.save(s)
+	return nil
+}
+
+// Models lists the models s's backend offers. The first ask per backend lists them in the
+// background and reports loading until they arrive.
+func (a *App) Models(s *Session) (models []Model, loading bool) {
+	ms, ok := a.models[s.Backend]
+	if ok {
+		return ms, ms == nil
+	}
+	a.models[s.Backend] = nil // listing
+	b, launcher := s.Backend, a.Backend(s).Launcher
+	go func() {
+		ms, err := launcher.Models(s.Cwd)
+		a.events <- AgentEvent{SessionID: s.SessionID, Event: ModelsListed{Backend: b, Models: ms, Err: err}}
+	}()
+	return nil, true
+}
+
+// Efforts lists the effort levels s's model accepts, or nil when its model isn't listed.
+func (a *App) Efforts(s *Session) []string {
+	id := cmp.Or(s.Model, a.L(s.SessionID).Model)
+	for _, m := range a.models[s.Backend] {
+		if m.ID == id {
+			return m.Efforts
+		}
+	}
+	return nil
+}
+
+func (a *App) unsupported(s *Session, what string) error {
+	return fmt.Errorf("%s: not available with %s", what, a.Backend(s).Label)
 }
 
 // Events delivers agent reports; pass each to Handle on the goroutine that calls every other App method.
@@ -129,7 +193,7 @@ func newUUID() string {
 
 func (a *App) NewSession(dir string, worktree bool) *Session {
 	t := a.now()
-	s := &Session{SessionID: "local_" + newUUID(), Cwd: dir, OriginCwd: dir, PermissionMode: "default",
+	s := &Session{SessionID: "local_" + newUUID(), Backend: DefaultBackend, Cwd: dir, OriginCwd: dir, PermissionMode: "default",
 		CreatedAt: t, LastActivityAt: t}
 	a.L(s.SessionID).wantWorktree = worktree
 	a.L(s.SessionID).loaded = true
@@ -154,7 +218,7 @@ func (a *App) EnsureLoaded(s *Session) {
 		return
 	}
 	l.loaded = true
-	es, err := a.transcripts.Load(s.Cwd, s.CLISessionID)
+	es, err := a.Backend(s).Transcripts.Load(s.Cwd, s.CLISessionID)
 	if err != nil {
 		l.Entries = append(l.Entries, Entry{Kind: "error", Text: "transcript unavailable: " + err.Error()})
 		return
@@ -167,7 +231,7 @@ func (a *App) ensureAgent(s *Session) (Agent, error) {
 	if l.agent != nil {
 		return l.agent, nil
 	}
-	ag, err := a.launcher.Start(s, a.events)
+	ag, err := a.Backend(s).Launcher.Start(s, a.events)
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +283,9 @@ func (a *App) InterruptAndSend(s *Session, text string) error {
 
 // Unqueue pulls the newest still-queued message back; done gets its text once the agent confirms.
 func (a *App) Unqueue(s *Session, done func(string)) error {
+	if !a.Backend(s).Unqueue {
+		return a.unsupported(s, "unqueue")
+	}
 	l := a.L(s.SessionID)
 	if len(l.Queued) == 0 || l.agent == nil {
 		return fmt.Errorf("nothing queued")
@@ -226,7 +293,7 @@ func (a *App) Unqueue(s *Session, done func(string)) error {
 	e := l.Queued[len(l.Queued)-1]
 	l.pending[l.agent.CancelQueued(e.UUID)] = func(r Reply) {
 		if !r.Cancelled {
-			a.Notice = "too late: Claude already read that message"
+			a.Notice = "too late: the agent already read that message"
 			return
 		}
 		for i, q := range l.Queued {
@@ -360,7 +427,7 @@ func (a *App) AcceptChip(parent *Session, i int) (*Session, error) {
 	}
 	s := a.NewSession(dir, a.worktrees.IsRepo(dir))
 	s.Title, s.TitleSource = c.Title, "task"
-	s.Model, s.Effort, s.PermissionMode = parent.Model, parent.Effort, parent.PermissionMode
+	s.Backend, s.Model, s.Effort, s.PermissionMode = parent.Backend, parent.Model, parent.Effort, parent.PermissionMode
 	s.SpawnedFrom = &SpawnedFrom{SessionID: parent.SessionID, TaskID: c.TaskID, Title: c.Title}
 	l.Chips = append(l.Chips[:i], l.Chips[i+1:]...)
 	return s, a.Send(s, c.Prompt)
@@ -385,6 +452,9 @@ func RewindTargets(l *Live) []Entry {
 }
 
 func (a *App) rewindTarget(s *Session, turn int) (string, error) {
+	if !a.Backend(s).Rewind {
+		return "", a.unsupported(s, "rewind")
+	}
 	targets := RewindTargets(a.L(s.SessionID))
 	if turn < 1 || turn > len(targets) {
 		return "", fmt.Errorf("turn must be 1-%d", len(targets))
@@ -433,6 +503,14 @@ func (a *App) CloseAll() {
 
 // Handle applies one agent event to app state.
 func (a *App) Handle(m AgentEvent) {
+	if e, ok := m.Event.(ModelsListed); ok {
+		if e.Err != nil {
+			a.Notice = "listing models: " + e.Err.Error()
+		}
+		// shortcut: a failed listing caches as empty until restart, rather than retrying on every redraw.
+		a.models[e.Backend] = append([]Model{}, e.Models...)
+		return
+	}
 	s := a.Find(m.SessionID)
 	if s == nil {
 		return
@@ -443,12 +521,12 @@ func (a *App) Handle(m AgentEvent) {
 		l.agent = nil
 		l.Perms = nil
 		for _, q := range l.Queued {
-			l.Entries = append(l.Entries, Entry{Kind: "error", Text: "not delivered (Claude Code exited): " + q.Text})
+			l.Entries = append(l.Entries, Entry{Kind: "error", Text: "not delivered (" + a.Backend(s).Label + " exited): " + q.Text})
 		}
 		l.Queued = nil
 		if l.Running {
 			l.Running, l.errored = false, true
-			l.Entries = append(l.Entries, Entry{Kind: "error", Text: fmt.Sprintf("Claude Code exited: %v", e.Err)})
+			l.Entries = append(l.Entries, Entry{Kind: "error", Text: fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err)})
 		}
 	case Initialized:
 		l.Version, l.Model = e.Version, e.Model
@@ -532,7 +610,7 @@ func (a *App) Handle(m AgentEvent) {
 		}
 		delete(l.pending, e.RequestID)
 		if e.Err != "" {
-			a.Notice = "Claude Code: " + e.Err
+			a.Notice = a.Backend(s).Label + ": " + e.Err
 			return
 		}
 		cb(e)

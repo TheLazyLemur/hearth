@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,8 +44,12 @@ func cliArgs(s *core.Session) []string {
 		"--permission-prompt-tool=stdio", "--include-partial-messages", "--replay-user-messages",
 		"--setting-sources", "user,project,local",
 		"--permission-mode", s.PermissionMode,
-		"--allowedTools", "mcp__" + mcpServerName + "__spawn_task,mcp__" + mcpServerName + "__dismiss_task",
 	}
+	var allowed []string
+	for _, t := range core.Tools {
+		allowed = append(allowed, "mcp__"+mcpServerName+"__"+t["name"].(string))
+	}
+	args = append(args, "--allowedTools", strings.Join(allowed, ","))
 	if s.Model != "" {
 		args = append(args, "--model", s.Model)
 	}
@@ -96,6 +102,61 @@ func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent
 		out <- core.AgentEvent{SessionID: s.SessionID, Event: core.Exited{Err: werr}}
 	}()
 	return p, nil
+}
+
+// Models starts a throwaway CLI and reads the model list from its initialize reply; no session is created.
+func (l Launcher) Models(cwd string) ([]core.Model, error) {
+	cmd := exec.Command(l.Binary, "--output-format", "stream-json", "--verbose", "--input-format", "stream-json")
+	cmd.Dir = cwd
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	defer cmd.Wait()
+	defer cmd.Process.Kill()
+	defer time.AfterFunc(30*time.Second, func() { cmd.Process.Kill() }).Stop()
+	p := &process{w: stdin}
+	id := p.request(map[string]any{"subtype": "initialize"})
+	r := bufio.NewReaderSize(stdout, 1<<20)
+	for {
+		line, err := r.ReadBytes('\n')
+		var m map[string]any
+		if json.Unmarshal(line, &m) == nil && m["type"] == "control_response" {
+			resp, _ := m["response"].(map[string]any)
+			if str(resp["request_id"]) == id {
+				if resp["subtype"] == "error" {
+					return nil, errors.New(str(resp["error"]))
+				}
+				inner, _ := resp["response"].(map[string]any)
+				return modelsFrom(inner), nil
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("claude exited without listing models: %w", err)
+		}
+	}
+}
+
+func modelsFrom(resp map[string]any) []core.Model {
+	arr, _ := resp["models"].([]any)
+	var out []core.Model
+	for _, a := range arr {
+		m, _ := a.(map[string]any)
+		var efforts []string
+		levels, _ := m["supportedEffortLevels"].([]any)
+		for _, e := range levels {
+			efforts = append(efforts, str(e))
+		}
+		out = append(out, core.Model{ID: str(m["value"]), Name: str(m["displayName"]), Description: str(m["description"]), Efforts: efforts})
+	}
+	return out
 }
 
 // decode turns one stdout line into a core event, or nil when core needn't see it.
@@ -163,21 +224,6 @@ func (p *process) control(m map[string]any) core.Event {
 	return nil
 }
 
-var mcpTools = []map[string]any{
-	{"name": "spawn_task", "description": "Suggest an out-of-scope follow-up (dead code, stale docs, missing tests, a confirmed TODO, a security issue noticed in passing) as a separate background task. The user sees a chip and can start it as its own session in a fresh worktree. Your turn continues. The prompt must stand alone: include file paths and context. Returns a task_id for dismiss_task.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"title", "prompt", "tldr"}, "properties": map[string]any{
-			"title":  map[string]any{"type": "string", "description": "Under 60 chars, imperative, e.g. \"Fix stale README badge\"."},
-			"prompt": map[string]any{"type": "string", "description": "Self-contained first message for the spawned session."},
-			"tldr":   map[string]any{"type": "string", "description": "One or two plain sentences: why now, and what the session will do."},
-			"cwd":    map[string]any{"type": "string", "description": "Optional absolute path to a different project root."},
-		}}},
-	{"name": "dismiss_task", "description": "Withdraw a task chip created with spawn_task that is now stale or superseded.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"task_id"}, "properties": map[string]any{
-			"task_id": map[string]any{"type": "string"},
-			"reason":  map[string]any{"type": "string"},
-		}}},
-}
-
 // mcp answers JSON-RPC for the in-process tui_session MCP server. Tool calls go
 // to core as events whose Reply sends the result.
 func (p *process) mcp(reqID string, m map[string]any) core.Event {
@@ -198,18 +244,11 @@ func (p *process) mcp(reqID string, m map[string]any) core.Event {
 			"serverInfo": map[string]any{"name": mcpServerName, "version": "0.1.0"}})
 		return nil
 	case "tools/list":
-		ok(map[string]any{"tools": mcpTools})
+		ok(map[string]any{"tools": core.Tools})
 		return nil
 	case "tools/call":
 		args, _ := params["arguments"].(map[string]any)
-		switch params["name"] {
-		case "spawn_task":
-			return core.TaskSuggested{Chip: core.Chip{Title: str(args["title"]), Prompt: str(args["prompt"]), Tldr: str(args["tldr"]), Cwd: str(args["cwd"])}, Reply: text}
-		case "dismiss_task":
-			return core.TaskDismissed{TaskID: str(args["task_id"]), Reply: text}
-		}
-		text(fmt.Sprintf("unknown tool %v", params["name"]), true)
-		return nil
+		return core.CallTool(str(params["name"]), args, text)
 	}
 	reply(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32601, "message": "method not found"}})
 	return nil

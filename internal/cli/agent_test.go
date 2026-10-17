@@ -149,3 +149,23 @@ func TestSpawnTaskCallBecomesSuggestionAnsweredOverMCP(t *testing.T) {
 		t.Fatalf("chip %+v resp %+v", task.Chip, resp)
 	}
 }
+
+func TestInitializeReplyListsModels(t *testing.T) {
+	// given
+	// ... the CLI's initialize reply with two models
+	var resp map[string]any
+	json.Unmarshal([]byte(`{"models":[{"value":"default","displayName":"Default (recommended)","description":"Opus 5.5 · Best for everyday, complex tasks","supportedEffortLevels":["low","high"]},
+		{"value":"haiku","displayName":"Haiku","description":"Haiku 5.5 · Fastest"}]}`), &resp)
+
+	// when
+	// ... its models are read
+	got := modelsFrom(resp)
+
+	// then
+	// ... each keeps its value as the id, with its name, description and effort levels
+	want := []core.Model{{ID: "default", Name: "Default (recommended)", Description: "Opus 5.5 · Best for everyday, complex tasks", Efforts: []string{"low", "high"}},
+		{ID: "haiku", Name: "Haiku", Description: "Haiku 5.5 · Fastest"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v", got)
+	}
+}
