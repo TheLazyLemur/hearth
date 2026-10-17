@@ -28,6 +28,7 @@ type Worktrees interface {
 // Backend is an agent harness a session can run on, and which optional features it has.
 type Backend struct {
 	Label           string // e.g. "Claude Code"
+	Tag             string // session-list prefix, e.g. "cl"
 	Launcher        Launcher
 	Transcripts     Transcripts
 	Rewind, Unqueue bool

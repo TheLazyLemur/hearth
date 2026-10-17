@@ -1171,10 +1171,7 @@ func (u *UI) drawSidebar(w, h int) {
 		if r.s.Branch != "" {
 			branch = "  ⎇ " + strings.TrimPrefix(r.s.Branch, "claude/")
 		}
-		tag := "" // before the title, which truncation would cut it from
-		if r.s.Backend != core.DefaultBackend {
-			tag = u.app.Backend(r.s).Label + " "
-		}
+		tag := u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
 		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.permission)}, span{t, st}, span{branch, fg(th.inactive)}))
 	}
 }

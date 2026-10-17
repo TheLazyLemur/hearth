@@ -30,10 +30,10 @@ func Run() error {
 	claudeJSON := filepath.Join(cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), home), ".claude.json")
 
 	app, err := core.NewApp(store.Store{Dir: filepath.Join(tuiHome, "sessions")}, map[string]core.Backend{
-		core.DefaultBackend: {Label: "Claude Code", Rewind: true, Unqueue: true,
+		core.DefaultBackend: {Label: "Claude Code", Tag: "cl", Rewind: true, Unqueue: true,
 			Launcher:    cli.Launcher{Binary: cmp.Or(os.Getenv("CLAUDE_TUI_CLI"), "claude")},
 			Transcripts: cli.Transcripts{ConfigDir: claudeConfig}},
-		"pi": {Label: "pi",
+		"pi": {Label: "pi", Tag: "pi",
 			Launcher: pi.Launcher{Binary: "pi"},
 			Transcripts: pi.Transcripts{Dir: cmp.Or(os.Getenv("PI_CODING_AGENT_SESSION_DIR"),
 				filepath.Join(cmp.Or(os.Getenv("PI_CODING_AGENT_DIR"), filepath.Join(home, ".pi", "agent")), "sessions"))}},
