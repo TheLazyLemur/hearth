@@ -84,6 +84,10 @@ Requirements:
 - Running turns, nested children and parent wakes survive `:q` and the laptop lid.
 - Every open hearth instance sees the same live state.
 - SSH via the same protocol over a forwarded socket.
+- Opening hearth in any terminal stays the natural way in. Sessions are shared; view state is per
+  client: focus, selection, collapsed groups, scroll, visual mode, and the launch folder. A client
+  launched in a folder focuses that project's group and selects its latest session; if the project
+  has no sessions, it shows the group with "new session here" instead of an empty list.
 
 Decide before building:
 
