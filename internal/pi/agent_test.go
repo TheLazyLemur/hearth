@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 type bufCloser struct{ bytes.Buffer }

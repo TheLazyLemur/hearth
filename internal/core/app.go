@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"claude-code-tui/pkg/random"
+	"hearth/pkg/random"
 )
 
 // Live is per-session runtime state; none of it is persisted.

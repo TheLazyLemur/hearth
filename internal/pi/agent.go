@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"claude-code-tui/internal/core"
-	"claude-code-tui/pkg/random"
+	"hearth/internal/core"
+	"hearth/pkg/random"
 )
 
 var (
@@ -109,7 +109,7 @@ func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent
 	}()
 	cmd := exec.Command("node", append([]string{"--input-type=module", "-e", hostJS, "--"}, piArgs(s)...)...)
 	cmd.Dir = s.Cwd
-	cmd.Env = append(os.Environ(), "CLAUDE_TUI_PI_PKG="+pkg, "CLAUDE_TUI_TOOLS="+string(tools))
+	cmd.Env = append(os.Environ(), "HEARTH_PI_PKG="+pkg, "HEARTH_TOOLS="+string(tools))
 	cmd.ExtraFiles = []*os.File{theirs} // fd 3
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

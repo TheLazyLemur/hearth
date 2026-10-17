@@ -3,7 +3,7 @@ package store
 import (
 	"testing"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 func TestStoreRoundTrip(t *testing.T) {

@@ -2,16 +2,18 @@ package app
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
-	"claude-code-tui/internal/cli"
-	"claude-code-tui/internal/core"
-	"claude-code-tui/internal/git"
-	"claude-code-tui/internal/pi"
-	"claude-code-tui/internal/store"
-	"claude-code-tui/internal/tui"
+	"hearth/internal/cli"
+	"hearth/internal/core"
+	"hearth/internal/git"
+	"hearth/internal/pi"
+	"hearth/internal/store"
+	"hearth/internal/tui"
 )
 
 // Run is the composition root: it builds the adapters, connects them to the core, and runs the TUI.
@@ -24,14 +26,20 @@ func Run() error {
 	if err != nil {
 		return fmt.Errorf("working directory: %w", err)
 	}
-	tuiHome := cmp.Or(os.Getenv("CLAUDE_TUI_HOME"), filepath.Join(home, ".claude-tui"))
+	hearthHome := cmp.Or(os.Getenv("HEARTH_HOME"), filepath.Join(home, ".hearth"))
+	// shortcut: one-off move of the pre-rename home; drop once no install still has ~/.claude-tui
+	if _, err := os.Stat(hearthHome); os.Getenv("HEARTH_HOME") == "" && errors.Is(err, fs.ErrNotExist) {
+		if err := os.Rename(filepath.Join(home, ".claude-tui"), hearthHome); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("move ~/.claude-tui to %s: %w", hearthHome, err)
+		}
+	}
 	claudeConfig := cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), filepath.Join(home, ".claude"))
 	// the CLI keeps .claude.json beside ~/.claude unless CLAUDE_CONFIG_DIR moves both
 	claudeJSON := filepath.Join(cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), home), ".claude.json")
 
-	app, err := core.NewApp(store.Store{Dir: filepath.Join(tuiHome, "sessions")}, map[string]core.Backend{
+	app, err := core.NewApp(store.Store{Dir: filepath.Join(hearthHome, "sessions")}, map[string]core.Backend{
 		core.DefaultBackend: {Label: "Claude Code", Tag: "cl", Rewind: true, Unqueue: true,
-			Launcher:    cli.Launcher{Binary: cmp.Or(os.Getenv("CLAUDE_TUI_CLI"), "claude")},
+			Launcher:    cli.Launcher{Binary: cmp.Or(os.Getenv("HEARTH_CLAUDE_CLI"), "claude")},
 			Transcripts: cli.Transcripts{ConfigDir: claudeConfig}},
 		"pi": {Label: "pi", Tag: "pi",
 			Launcher: pi.Launcher{Binary: "pi"},

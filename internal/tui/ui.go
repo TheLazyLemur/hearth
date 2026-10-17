@@ -16,7 +16,7 @@ import (
 	"github.com/charmbracelet/ultraviolet/screen"
 	"github.com/charmbracelet/x/ansi"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 var (
@@ -1185,23 +1185,24 @@ func spinnerFrame(start time.Time) string {
 	return spinnerFrames[i]
 }
 
-// logo is the CLI's welcome header: Clawd, version, model and where the session runs.
-func (u *UI) logo(s *core.Session, l *core.Live) []line {
-	cl, body, dim := fg(th.claude), uv.Style{Fg: th.claude, Bg: th.logoBg}, fg(th.inactive)
+// header opens the transcript: the hearth, backend, version, model and where the session runs.
+func (u *UI) header(s *core.Session, l *core.Live) []line {
+	stone, flame, ember, dim := fg(th.inactive), fg(th.claude), fg(th.warning), fg(th.inactive)
 	ver := ""
 	if l.Version != "" {
 		ver = " v" + l.Version
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
+	gap := span{"   ", uv.Style{}}
 	return []line{
-		ln(span{" ▐", cl}, span{"▛███▛█", body}, span{"   ", uv.Style{}}, span{u.app.Backend(s).Label, uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
-		ln(span{"▝▜", cl}, span{"█████", body}, span{"█▀", cl}, span{"  ", uv.Style{}}, span{model, dim}),
-		ln(span{" ▝▝   ▝▝ ", cl}, span{"  ", uv.Style{}}, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
+		ln(span{" ▟▀▀▀▀▀▙", stone}, gap, span{u.app.Backend(s).Label, uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
+		ln(span{" █ ", stone}, span{"▗█▖", flame}, span{" █", stone}, gap, span{model, dim}),
+		ln(span{" █", stone}, span{"▟█", flame}, span{"█", ember}, span{"█▙", flame}, span{"█", stone}, gap, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
 	}
 }
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
-	lines := u.logo(s, l)
+	lines := u.header(s, l)
 	for i := range lines {
 		lines[i].deco = true
 	}

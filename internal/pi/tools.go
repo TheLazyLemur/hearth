@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 // hostJS runs pi's own CLI entry point with core.Tools added and every other tool call

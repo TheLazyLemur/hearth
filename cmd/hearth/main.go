@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"claude-code-tui/cmd/claude-tui/app"
+	"hearth/cmd/hearth/app"
 )
 
 func main() {

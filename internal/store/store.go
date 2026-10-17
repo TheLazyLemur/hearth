@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 var _ core.SessionStore = Store{}

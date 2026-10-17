@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"claude-code-tui/internal/core"
-	"claude-code-tui/pkg/random"
+	"hearth/internal/core"
+	"hearth/pkg/random"
 )
 
 // mcpServerName is the in-process MCP server the TUI hosts over the control
 // protocol, like the desktop's "ccd_session" (spawn_task / dismiss_task).
-const mcpServerName = "tui_session"
+const mcpServerName = "hearth"
 
 var (
 	_ core.Launcher = Launcher{}
@@ -220,11 +220,11 @@ func (p *process) control(m map[string]any) core.Event {
 		msg, _ := req["message"].(map[string]any)
 		return p.mcp(id, msg)
 	}
-	p.respondErr(id, fmt.Sprintf("claude-tui does not support %v", req["subtype"]))
+	p.respondErr(id, fmt.Sprintf("hearth does not support %v", req["subtype"]))
 	return nil
 }
 
-// mcp answers JSON-RPC for the in-process tui_session MCP server. Tool calls go
+// mcp answers JSON-RPC for the in-process hearth MCP server. Tool calls go
 // to core as events whose Reply sends the result.
 func (p *process) mcp(reqID string, m map[string]any) core.Event {
 	reply := func(resp map[string]any) { p.respond(reqID, map[string]any{"mcp_response": resp}) }

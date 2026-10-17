@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 var _ core.Transcripts = Transcripts{}

@@ -9,8 +9,8 @@
 // for permissions.
 import net from "node:net";
 
-const { main } = await import(process.env.CLAUDE_TUI_PI_PKG + "/dist/index.js");
-const tools = JSON.parse(process.env.CLAUDE_TUI_TOOLS);
+const { main } = await import(process.env.HEARTH_PI_PKG + "/dist/index.js");
+const tools = JSON.parse(process.env.HEARTH_TOOLS);
 const channel = new net.Socket({ fd: 3, readable: true, writable: true });
 const send = m => channel.write(JSON.stringify(m) + "\n");
 const pending = new Map();

@@ -12,7 +12,7 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 // picker is a snacks-style floating finder: sessions by fuzzy title, or a grep

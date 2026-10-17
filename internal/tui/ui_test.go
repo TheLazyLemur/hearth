@@ -6,7 +6,7 @@ import (
 
 	uv "github.com/charmbracelet/ultraviolet"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 func TestSidebarGroupsSessionsUnderProjects(t *testing.T) {

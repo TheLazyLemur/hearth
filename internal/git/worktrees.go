@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"claude-code-tui/internal/core"
-	"claude-code-tui/pkg/random"
+	"hearth/internal/core"
+	"hearth/pkg/random"
 )
 
 var _ core.Worktrees = Worktrees{}

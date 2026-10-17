@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"claude-code-tui/internal/core"
+	"hearth/internal/core"
 )
 
 type bufCloser struct{ bytes.Buffer }
@@ -129,10 +129,10 @@ func TestAlwaysAllowAnswersWithSuggestedPermissions(t *testing.T) {
 
 func TestSpawnTaskCallBecomesSuggestionAnsweredOverMCP(t *testing.T) {
 	// given
-	// ... the model calls spawn_task through the tui_session MCP server
+	// ... the model calls spawn_task through the hearth MCP server
 	w := &bufCloser{}
 	p := &process{w: w}
-	ev := decodeLine(t, p, `{"type":"control_request","request_id":"m1","request":{"subtype":"mcp_message","server_name":"tui_session",
+	ev := decodeLine(t, p, `{"type":"control_request","request_id":"m1","request":{"subtype":"mcp_message","server_name":"hearth",
 		"message":{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"spawn_task","arguments":{"title":"Fix stale docs","prompt":"Update README.md","tldr":"x"}}}}}`)
 	task := ev.(core.TaskSuggested)
 
