@@ -553,4 +553,5 @@ type screenLine struct {
 	decoration  bool    // not content (the logo, the spinner): yanks skip it
 	source      *string // raw markdown the row was rendered from, nil for plain rows
 	block       *string // markdown chunk the row shows, rendered or raw, nil for plain rows
+	entry       int     // index+1 of the transcript entry the row draws, 0 for none
 }

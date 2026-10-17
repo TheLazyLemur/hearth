@@ -100,7 +100,10 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
-	launched     string // default folder for new sessions
+	launched     string  // default folder for new sessions
+	pick         *picker // the open session or grep picker
+	lead         bool    // the last key was a lone space: the start of a picker chord
+	jump         int     // entry+1 to put the transcript cursor on at the next draw (grep hits)
 }
 
 // Run drives app from the terminal until the user quits. launched is the
@@ -194,6 +197,9 @@ func (u *UI) event(ev uv.Event) {
 	case uv.PasteEvent:
 		text := strings.ReplaceAll(ev.Content, "\r\n", "\n")
 		switch {
+		case u.pick != nil:
+			u.pick.query = append(u.pick.query, []rune(strings.ReplaceAll(text, "\n", " "))...)
+			u.refreshPicker()
 		case u.prompt != nil:
 			u.insertText(text)
 		case u.pane == paneSession && u.focus == focusInput:
@@ -206,7 +212,13 @@ func (u *UI) event(ev uv.Event) {
 }
 
 func (u *UI) key(k uv.KeyPressEvent) {
+	if u.pick != nil {
+		u.pickKey(k)
+		return
+	}
 	s := u.session()
+	lead := u.lead
+	u.lead = false
 	if k.MatchString("ctrl+c") {
 		if s != nil && u.app.Status(s) == "running" {
 			u.app.Interrupt(s)
@@ -217,6 +229,9 @@ func (u *UI) key(k uv.KeyPressEvent) {
 	}
 	if u.prompt != nil {
 		u.promptKey(k)
+		return
+	}
+	if u.idleNormal(s) && u.leader(k, lead) {
 		return
 	}
 	if s != nil && u.pane == paneSession {
@@ -522,6 +537,12 @@ func (u *UI) command(line string) {
 	case "archived":
 		u.showArchived, u.sel = !u.showArchived, ""
 		return
+	case "ls":
+		u.openPicker(false, "")
+		return
+	case "grep":
+		u.openPicker(true, arg)
+		return
 	}
 	if s == nil {
 		u.app.Notice = "no session"
@@ -691,6 +712,7 @@ type line struct {
 	tag    span      // drawn at the row's right edge, outside the text
 	source *string   // raw markdown the row was rendered from: yanks copy it instead
 	block  *string   // markdown chunk the row shows, rendered or raw
+	entry  int       // index+1 of the Live entry the row draws, 0 for none
 }
 
 func ln(spans ...span) line              { return line{spans: spans} }
@@ -916,6 +938,10 @@ func (u *UI) draw() {
 			u.tv.cursor, u.tv.anchor = remap(u.tv.cursor, old, u.slines), remap(u.tv.anchor, old, u.slines)
 			u.tv.scrollTop += u.tv.cursor.line - was
 		}
+		if u.jump > 0 {
+			u.tv.cursor = matchPos(u.slines, u.jump, u.tv.search.pattern)
+			u.tv.scrollTop, u.jump = u.tv.cursor.line-u.view/3, 0
+		}
 		viewing := u.pane == paneSession && u.focus == focusView
 		if viewing {
 			u.tv.clampAndScroll(u.slines, u.view)
@@ -929,6 +955,9 @@ func (u *UI) draw() {
 		if viewing {
 			u.drawViewMarks(x, start, cy < 0)
 		}
+	}
+	if u.pick != nil {
+		u.drawPicker(W, H)
 	}
 	scr.Render()
 	scr.Flush()
@@ -957,20 +986,8 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 				hit[c] = true
 			}
 		}
-		for _, m := range matchStarts(cells, pat, ignoresCase(pat)) {
-			for c := m; c < m+len(pat); c++ {
-				hit[c] = true
-			}
-		}
-		cx := x
-		for c, ce := range cells {
-			if cell := u.scr.CellAt(cx, i); hit[c] && cell != nil {
-				rev := *cell
-				rev.Style.Attrs |= uv.AttrReverse
-				u.scr.SetCell(cx, i, &rev)
-			}
-			cx += ansi.StringWidth(string(ce.char))
-		}
+		markMatches(hit, cells, pat)
+		u.reverseCells(x, i, cells, hit)
 	}
 	if c := u.tv.cursor; showCursor && c.line >= start && c.line < start+u.view && c.line < len(u.slines) {
 		cells := u.slines[c.line].cells
@@ -983,11 +1000,31 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 	}
 }
 
+func markMatches(hit []bool, cells []cell, pat []rune) {
+	for _, m := range matchStarts(cells, pat, ignoresCase(pat)) {
+		for c := m; c < m+len(pat); c++ {
+			hit[c] = true
+		}
+	}
+}
+
+// reverseCells reverses the drawn cells of row y, starting at x, where hit is set.
+func (u *UI) reverseCells(x, y int, cells []cell, hit []bool) {
+	for c, ce := range cells {
+		if cell := u.scr.CellAt(x, y); hit[c] && cell != nil {
+			rev := *cell
+			rev.Style.Attrs |= uv.AttrReverse
+			u.scr.SetCell(x, y, &rev)
+		}
+		x += ansi.StringWidth(string(ce.char))
+	}
+}
+
 // screenLines gives the view each row's text and the breaks yanks rejoin it by.
 func screenLines(lines []line) []screenLine {
 	out := make([]screenLine, len(lines))
 	for i, l := range lines {
-		sl := screenLine{prefixLen: l.prefix, breakBefore: l.brk, startsEntry: l.starts, decoration: l.deco, source: l.source, block: l.block}
+		sl := screenLine{prefixLen: l.prefix, breakBefore: l.brk, startsEntry: l.starts, decoration: l.deco, source: l.source, block: l.block, entry: l.entry}
 		for _, sp := range l.spans {
 			for _, r := range sp.t {
 				sl.cells = append(sl.cells, cell{r})
@@ -1026,15 +1063,7 @@ func (u *UI) drawSidebar(w, h int) {
 				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.inactive)}))
 			continue
 		}
-		glyph, gst := " ", uv.Style{}
-		switch u.app.Status(r.s) {
-		case "running":
-			glyph, gst = spinnerFrame(u.app.L(r.s.SessionID).Started), fg(th.claude)
-		case "waiting":
-			glyph, gst = "?", fg(th.permission)
-		case "error":
-			glyph, gst = "✗", fg(th.error)
-		}
+		glyph, gst := u.statusGlyph(r.s)
 		star := "  "
 		if r.s.IsStarred {
 			star = "★ "
@@ -1092,7 +1121,7 @@ func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	}
 	dim := fg(th.inactive)
 	turn := 0
-	for _, e := range l.Entries {
+	for i, e := range l.Entries {
 		if e.Kind == "result" && tools[e.ID] {
 			continue // drawn under its tool call
 		}
@@ -1135,6 +1164,9 @@ func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 		}
 		if first < len(lines) {
 			lines[first].starts = true
+		}
+		for j := first; j < len(lines); j++ {
+			lines[j].entry = i + 1
 		}
 	}
 	if l.Running && len(l.Perms) == 0 {
@@ -1281,13 +1313,13 @@ func (u *UI) footer(s *core.Session, w int) []line {
 		}
 	}
 	if u.help {
-		help := "j/k move · l open · h project · za fold · o new · r rename · s star · a archive · dd delete · A archived · :q quit"
+		help := "j/k move · l open · h project · za fold · o new · r rename · s star · a archive · dd delete · A archived · space space sessions · space / grep · :q quit"
 		if u.pane == paneSession {
 			help = "INSERT  enter send/queue · ctrl+s interrupt+send · ctrl+j newline · esc → NORMAL\n" +
 				"NORMAL  h j k l w b e 0 ^ $ · d c y + motion, dd cc yy · x X r D C · o O p P u · enter send · i a I A · k on top line → VIEW · esc interrupt\n" +
 				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
 				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt\n" +
-				"        ctrl+h list · :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
+				"        space space sessions · space / grep · ctrl+h list · :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
 		}
 		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
 	}

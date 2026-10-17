@@ -122,3 +122,71 @@ func TestVisualModeSelectsRawMarkdownWhereTheCursorWas(t *testing.T) {
 		t.Fatalf("register %q", string(register))
 	}
 }
+
+func TestSessionPickerRanksWordStartMatchesFirst(t *testing.T) {
+	// given
+	// ... sessions in recency order: a scattered match, a non-match, then a word-start match
+	vs := []*core.Session{
+		{SessionID: "local_1", Title: "rename markdown", OriginCwd: "/p/app"},
+		{SessionID: "local_2", Title: "docs", OriginCwd: "/p/app"},
+		{SessionID: "local_3", Title: "Refactor kit", OriginCwd: "/p/app"},
+	}
+
+	// when
+	// ... the picker query is "rk"
+	items := sessionItems(vs, []rune("rk"))
+
+	// then
+	// ... the non-match is dropped and the word-start match leads despite being older
+	var got []string
+	for _, it := range items {
+		got = append(got, it.s.SessionID)
+	}
+	if strings.Join(got, ",") != "local_3,local_1" {
+		t.Fatalf("order %v", got)
+	}
+}
+
+type fakeStore struct{ ss []*core.Session }
+
+func (f fakeStore) Load() ([]*core.Session, error) { return f.ss, nil }
+func (fakeStore) Save(*core.Session) error         { return nil }
+func (fakeStore) Delete(string) error              { return nil }
+
+type fakeTranscripts map[string][]core.Entry
+
+func (f fakeTranscripts) Load(_, id string) ([]core.Entry, error) { return f[id], nil }
+
+func TestGrepHitOpensTheSessionWithTheCursorOnTheMatch(t *testing.T) {
+	// given
+	// ... a session whose tool output and reply both mention glamour, deep enough to need scrolling
+	s := &core.Session{SessionID: "local_1", CLISessionID: "c1", Title: "render", OriginCwd: "/p"}
+	es := []core.Entry{{Kind: "user", Text: "add markdown", UUID: "u1"}, {Kind: "tool", Text: "Bash(grep glamour)", ID: "t1"},
+		{Kind: "result", Text: "glamour v2", ID: "t1"}, {Kind: "assistant", Text: strings.Repeat("filler\n\n", 5) + "Rendered with **glamour** now."}}
+	app, err := core.NewApp(fakeStore{[]*core.Session{s}}, fakeTranscripts{"c1": es}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &UI{app: app, collapsed: map[string]bool{}}
+
+	// when
+	// ... "glamour" is grepped and the only hit opened, then the transcript is laid out as draw does
+	u.openPicker(true, "glamour")
+	items := u.pick.items
+	u.pickKey(uv.KeyPressEvent{Code: uv.KeyEnter})
+	lines := screenLines(u.transcript(s, app.L(s.SessionID), 60))
+	cur := matchPos(lines, u.jump, u.tv.search.pattern)
+
+	// then
+	// ... tool output is skipped, the reply's line is the hit, and the cursor sits on "glamour" in the rendered reply
+	if len(items) != 1 || string(items[0].text) != "Rendered with **glamour** now." || items[0].who != "⏺ " {
+		t.Fatalf("items %+v", items)
+	}
+	var at []rune
+	for _, c := range lines[cur.line].cells[cur.col:min(cur.col+7, len(lines[cur.line].cells))] {
+		at = append(at, c.char)
+	}
+	if u.focus != focusView || string(at) != "glamour" {
+		t.Fatalf("focus %d cursor %+v", u.focus, cur)
+	}
+}
