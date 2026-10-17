@@ -1,10 +1,9 @@
-package main
+package tui
 
 import (
 	"cmp"
 	"fmt"
 	"image/color"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +14,8 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/ultraviolet/screen"
 	"github.com/charmbracelet/x/ansi"
+
+	"claude-code-tui/internal/core"
 )
 
 var (
@@ -42,7 +43,7 @@ type prompt struct {
 // row is one sidebar line: a project header (s == nil) or a session under it.
 type row struct {
 	project string
-	s       *Session
+	s       *core.Session
 }
 
 func (r row) key() string {
@@ -54,9 +55,9 @@ func (r row) key() string {
 
 // groupRows groups sessions under their project (originCwd). Projects are ordered by
 // their first session in vs, so the project holding the most recent/starred work leads.
-func groupRows(vs []*Session, collapsed map[string]bool) []row {
+func groupRows(vs []*core.Session, collapsed map[string]bool) []row {
 	var order []string
-	by := map[string][]*Session{}
+	by := map[string][]*core.Session{}
 	for _, s := range vs {
 		if _, ok := by[s.OriginCwd]; !ok {
 			order = append(order, s.OriginCwd)
@@ -76,7 +77,7 @@ func groupRows(vs []*Session, collapsed map[string]bool) []row {
 }
 
 type UI struct {
-	app          *App
+	app          *core.App
 	scr          *uv.TerminalScreen
 	ctx          *screen.Context
 	pane         int
@@ -99,50 +100,50 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
+	launched     string // default folder for new sessions
 }
 
-func main() {
-	app, err := newApp(defaultStore())
-	if err != nil {
-		log.Fatal(err)
-	}
+// Run drives app from the terminal until the user quits. launched is the
+// default folder for new sessions; claudeJSON is the CLI's settings file, for the theme.
+func Run(app *core.App, launched, claudeJSON string) error {
 	t := uv.DefaultTerminal()
 	scr := t.Screen()
 	scr.EnterAltScreen()
 	scr.EnableBracketedPaste()
 	if err := t.Start(); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	th = loadTheme()
+	th = loadTheme(claudeJSON)
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
-	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}}
-	if vs := app.visible(false); len(vs) > 0 {
+	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
+	if vs := app.Visible(false); len(vs) > 0 {
 		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
 	}
 	defer func() {
-		app.closeAll()
+		app.CloseAll()
 		t.Stop()
 	}()
 	for !u.quit {
 		select {
 		case ev, ok := <-t.Events():
 			if !ok {
-				return
+				return nil
 			}
 			u.event(ev)
-		case m := <-app.agentCh:
-			app.handle(m)
+		case m := <-app.Events():
+			app.Handle(m)
 		case <-tick.C:
-			if !app.anyRunning() {
+			if !app.AnyRunning() {
 				continue
 			}
 		}
 		u.draw()
 	}
+	return nil
 }
 
-func (u *UI) rows() []row { return groupRows(u.app.visible(u.showArchived), u.collapsed) }
+func (u *UI) rows() []row { return groupRows(u.app.Visible(u.showArchived), u.collapsed) }
 
 // selRow returns the selected sidebar row, falling back to the first one.
 func (u *UI) selRow() (row, int, []row) {
@@ -160,18 +161,18 @@ func (u *UI) selRow() (row, int, []row) {
 }
 
 // session is the one shown in the main pane.
-func (u *UI) session() *Session {
-	if s := u.app.find(u.cur); s != nil && s.IsArchived == u.showArchived {
+func (u *UI) session() *core.Session {
+	if s := u.app.Find(u.cur); s != nil && s.IsArchived == u.showArchived {
 		return s
 	}
-	if vs := u.app.visible(u.showArchived); len(vs) > 0 {
+	if vs := u.app.Visible(u.showArchived); len(vs) > 0 {
 		u.cur = vs[0].SessionID
 		return vs[0]
 	}
 	return nil
 }
 
-func (u *UI) open(s *Session) {
+func (u *UI) open(s *core.Session) {
 	u.cur, u.sel, u.tv, u.focus = s.SessionID, s.SessionID, transcriptView{}, focusInput
 	u.collapsed[s.OriginCwd] = false
 }
@@ -199,7 +200,7 @@ func (u *UI) event(ev uv.Event) {
 			u.ed.insertText([]rune(text))
 		}
 	case uv.KeyPressEvent:
-		u.app.notice = ""
+		u.app.Notice = ""
 		u.key(ev)
 	}
 }
@@ -207,10 +208,10 @@ func (u *UI) event(ev uv.Event) {
 func (u *UI) key(k uv.KeyPressEvent) {
 	s := u.session()
 	if k.MatchString("ctrl+c") {
-		if s != nil && u.app.status(s) == "running" {
-			u.app.interrupt(s)
+		if s != nil && u.app.Status(s) == "running" {
+			u.app.Interrupt(s)
 		} else {
-			u.app.notice = "type :q to quit"
+			u.app.Notice = "type :q to quit"
 		}
 		return
 	}
@@ -220,10 +221,10 @@ func (u *UI) key(k uv.KeyPressEvent) {
 	}
 	if s != nil && u.pane == paneSession {
 		switch {
-		case len(u.app.L(s.SessionID).perms) > 0 && u.app.L(s.SessionID).perms[0].Answers == nil:
+		case len(u.app.L(s.SessionID).Perms) > 0 && u.app.L(s.SessionID).Perms[0].Answers == nil:
 			u.cardKey(s, k)
 		case k.MatchString("shift+tab"):
-			u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+			u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
 		case u.focus == focusView:
 			u.viewKey(s, k)
 		default:
@@ -248,7 +249,7 @@ func (u *UI) key(k uv.KeyPressEvent) {
 			u.pane = paneSession
 		}
 	case k.MatchString("shift+tab") && s != nil:
-		u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+		u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
 	default:
 		u.sidebarKey(seq)
 	}
@@ -258,7 +259,7 @@ func (u *UI) sidebarKey(seq string) {
 	r, i, rs := u.selRow()
 	if i < 0 {
 		if seq == "o" || seq == "O" {
-			u.ask(":", "e "+shortPath(u.app.launched), u.command)
+			u.ask(":", "e "+shortPath(u.launched), u.command)
 		}
 		return
 	}
@@ -309,18 +310,16 @@ func (u *UI) sidebarKey(seq string) {
 	case "r":
 		u.ask(":", "rename "+r.s.Title, u.command)
 	case "s":
-		r.s.IsStarred = !r.s.IsStarred
-		u.app.save(r.s)
+		u.app.ToggleStar(r.s)
 	case "a":
-		r.s.IsArchived = !r.s.IsArchived
-		u.app.save(r.s)
+		u.app.ToggleArchive(r.s)
 	case "dd":
 		u.confirmDelete(r.s)
 	}
 }
 
 // inputKey edits the prompt: grimalkin's vim editor plus the session's own chords.
-func (u *UI) inputKey(s *Session, k uv.KeyPressEvent) {
+func (u *UI) inputKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	normal := u.ed.mode == modeNormal
 	switch {
@@ -343,7 +342,7 @@ func (u *UI) inputKey(s *Session, k uv.KeyPressEvent) {
 		u.help = !u.help
 		return
 	case normal && key == keyEsc:
-		u.app.interrupt(s)
+		u.app.Interrupt(s)
 		return
 	case normal && k.MatchString("ctrl+h"):
 		u.pane = paneSidebar
@@ -358,7 +357,7 @@ func (u *UI) inputKey(s *Session, k uv.KeyPressEvent) {
 }
 
 // viewKey moves the transcript cursor; keys the view leaves free run session commands.
-func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
+func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	tv := &u.tv
 	if !tv.search.typing && tv.visual == visualOff && tv.pendingKey == 0 && !tv.pendingWindowCmd {
@@ -366,7 +365,7 @@ func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
 		u.op = ""
 		switch {
 		case key == keyEsc && tv.search.pattern == nil:
-			u.app.interrupt(s)
+			u.app.Interrupt(s)
 			return
 		case k.MatchString("ctrl+h"):
 			u.pane = paneSidebar
@@ -381,7 +380,7 @@ func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
 			u.unqueue(s)
 			return
 		case char == 'm':
-			u.app.setMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
+			u.app.SetMode(s, modes[(indexStr(modes, s.PermissionMode)+1)%len(modes)])
 			return
 		case char == 'M':
 			u.ask(":", "model "+s.Model, u.command)
@@ -396,7 +395,7 @@ func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
 	}
 	act := tv.handleKey(u.slines, u.view, &u.register, char, key)
 	if tv.note != "" {
-		u.app.notice, tv.note = tv.note, ""
+		u.app.Notice, tv.note = tv.note, ""
 	}
 	switch act {
 	case viewInsert:
@@ -410,7 +409,7 @@ func (u *UI) viewKey(s *Session, k uv.KeyPressEvent) {
 	case viewCommand:
 		u.ask(":", "", u.command)
 	case viewQuit:
-		u.app.notice = "type :q to quit"
+		u.app.Notice = "type :q to quit"
 	}
 }
 
@@ -420,7 +419,7 @@ func (u *UI) focusView() {
 }
 
 // submit sends the prompt (queued by the CLI if a turn is running), or answers a question.
-func (u *UI) submit(s *Session, interrupt bool) {
+func (u *UI) submit(s *core.Session, interrupt bool) {
 	l := u.app.L(s.SessionID)
 	text := strings.TrimSpace(string(u.ed.text))
 	if text == "" {
@@ -428,22 +427,22 @@ func (u *UI) submit(s *Session, interrupt bool) {
 	}
 	var err error
 	switch {
-	case len(l.perms) > 0: // AskUserQuestion answer
-		u.answerQuestion(s, l.perms[0], text)
+	case len(l.Perms) > 0: // AskUserQuestion answer
+		err = u.app.AnswerQuestion(s, text)
 	case interrupt:
-		err = u.app.interruptAndSend(s, text)
+		err = u.app.InterruptAndSend(s, text)
 	default:
-		err = u.app.send(s, text)
+		err = u.app.Send(s, text)
 	}
 	if err != nil {
-		u.app.notice = err.Error()
+		u.app.Notice = err.Error()
 		return
 	}
 	u.ed.reset()
 }
 
-func (u *UI) unqueue(s *Session) {
-	u.must(u.app.unqueue(s, func(text string) {
+func (u *UI) unqueue(s *core.Session) {
+	u.must(u.app.Unqueue(s, func(text string) {
 		u.ed.text, u.focus = []rune(text), focusInput
 		u.ed.startInsert(len(u.ed.text))
 	}))
@@ -454,15 +453,15 @@ func (u *UI) yanked() {
 	cmd := exec.Command("pbcopy")
 	cmd.Stdin = strings.NewReader(string(u.register))
 	if err := cmd.Run(); err != nil {
-		u.app.notice = "yanked; clipboard: " + err.Error()
+		u.app.Notice = "yanked; clipboard: " + err.Error()
 		return
 	}
-	u.app.notice = fmt.Sprintf("yanked %d characters", len(u.register))
+	u.app.Notice = fmt.Sprintf("yanked %d characters", len(u.register))
 }
 
 // cardKey drives the permission dialog: j/k or arrows and enter, a number, or esc to deny.
-func (u *UI) cardKey(s *Session, k uv.KeyPressEvent) {
-	opts := permOptions(u.app.L(s.SessionID).perms[0])
+func (u *UI) cardKey(s *core.Session, k uv.KeyPressEvent) {
+	opts := permOptions(u.app.L(s.SessionID).Perms[0])
 	pick := -1
 	switch {
 	case k.MatchString("j", "down", "tab"):
@@ -482,7 +481,7 @@ func (u *UI) cardKey(s *Session, k uv.KeyPressEvent) {
 	}
 	if pick >= 0 {
 		u.permSel = 0
-		u.must(u.app.answerPerm(s, opts[pick].allow, opts[pick].always))
+		u.must(u.app.AnswerPerm(s, opts[pick].allow, opts[pick].always))
 	}
 }
 
@@ -515,7 +514,7 @@ func (u *UI) command(line string) {
 			if r, _, _ := u.selRow(); r.project != "" {
 				arg = r.project
 			} else {
-				arg = u.app.launched
+				arg = u.launched
 			}
 		}
 		u.newSessionAt(arg)
@@ -525,81 +524,66 @@ func (u *UI) command(line string) {
 		return
 	}
 	if s == nil {
-		u.app.notice = "no session"
+		u.app.Notice = "no session"
 		return
 	}
 	n, nerr := strconv.Atoi(arg)
 	switch name {
 	case "rename":
 		if arg != "" {
-			u.app.rename(s, arg)
+			u.app.Rename(s, arg)
 		}
 	case "model":
 		if arg != "" {
-			u.app.setModel(s, arg)
+			u.app.SetModel(s, arg)
 		}
 	case "effort":
 		if indexStr(efforts, arg) < 0 {
-			u.app.notice = "effort: low|medium|high|xhigh|max"
+			u.app.Notice = "effort: low|medium|high|xhigh|max"
 			return
 		}
-		u.app.setEffort(s, arg)
+		u.app.SetEffort(s, arg)
 	case "mode":
 		if indexStr(modes, arg) < 0 {
-			u.app.notice = "mode: " + strings.Join(modes, "|")
+			u.app.Notice = "mode: " + strings.Join(modes, "|")
 			return
 		}
-		u.app.setMode(s, arg)
+		u.app.SetMode(s, arg)
 	case "rewind":
 		if nerr != nil {
-			u.app.notice = "usage: :rewind <turn number>"
+			u.app.Notice = "usage: :rewind <turn number>"
 			return
 		}
 		u.rewind(s, n)
 	case "task":
-		if ns, err := u.app.acceptChip(s, n-1); err != nil {
-			u.app.notice = err.Error()
+		if ns, err := u.app.AcceptChip(s, n-1); err != nil {
+			u.app.Notice = err.Error()
 		} else {
-			u.app.notice = "started task in background: " + ns.Title
+			u.app.Notice = "started task in background: " + ns.Title
 		}
 	case "dismiss":
-		u.app.dismissChip(s, n-1)
+		u.app.DismissChip(s, n-1)
 	case "unqueue":
 		u.unqueue(s)
 	case "star":
-		s.IsStarred = !s.IsStarred
-		u.app.save(s)
+		u.app.ToggleStar(s)
 	case "archive":
-		s.IsArchived = !s.IsArchived
-		u.app.save(s)
+		u.app.ToggleArchive(s)
 	case "delete":
 		u.confirmDelete(s)
 	default:
-		u.app.notice = "not a command: " + name
+		u.app.Notice = "not a command: " + name
 	}
 }
 
-func (u *UI) confirmDelete(s *Session) {
+func (u *UI) confirmDelete(s *core.Session) {
 	u.ask(fmt.Sprintf("Delete %q? [y/N] ", s.Title), "", func(v string) {
 		if strings.EqualFold(v, "y") {
-			if err := u.app.deleteSession(s); err != nil {
-				u.app.notice = err.Error()
+			if err := u.app.Delete(s); err != nil {
+				u.app.Notice = err.Error()
 			}
 		}
 	})
-}
-
-func (u *UI) answerQuestion(s *Session, p *Perm, text string) {
-	qs := questions(p)
-	q := qs[len(p.Answers)]
-	ans := text
-	if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(q.options) {
-		ans = q.options[n-1]
-	}
-	p.Answers[q.question] = ans
-	if len(p.Answers) == len(qs) {
-		u.must(u.app.answerPerm(s, true, false))
-	}
 }
 
 func (u *UI) newSessionAt(v string) {
@@ -609,7 +593,7 @@ func (u *UI) newSessionAt(v string) {
 	}
 	abs, err := filepath.Abs(v)
 	if st, serr := os.Stat(abs); err != nil || serr != nil || !st.IsDir() {
-		u.app.notice = "not a folder: " + v
+		u.app.Notice = "not a folder: " + v
 		return
 	}
 	u.newSessionIn(abs)
@@ -617,46 +601,35 @@ func (u *UI) newSessionAt(v string) {
 
 func (u *UI) newSessionIn(dir string) {
 	create := func(wt bool) {
-		s := u.app.newSession(dir, wt)
+		s := u.app.NewSession(dir, wt)
 		u.open(s)
 		u.pane, u.focus, u.showArchived = paneSession, focusInput, false
 		u.ed.startInsert(len(u.ed.text))
 	}
-	if _, err := git(dir, "rev-parse", "--show-toplevel"); err != nil {
+	if !u.app.IsRepo(dir) {
 		create(false)
 		return
 	}
 	u.ask("Work in an isolated git worktree? [Y/n] ", "", func(v string) { create(!strings.EqualFold(v, "n")) })
 }
 
-func (u *UI) rewind(s *Session, n int) {
-	targets := rewindTargets(u.app.L(s.SessionID))
-	if n < 1 || n > len(targets) {
-		u.app.notice = fmt.Sprintf("turn must be 1-%d", len(targets))
-		return
-	}
-	id := targets[n-1].UUID
-	u.must(u.app.call(s, map[string]any{"subtype": "rewind_files", "user_message_id": id, "dry_run": true}, func(r map[string]any) {
-		if r["canRewind"] != true {
-			u.app.notice = "cannot rewind: " + str(r["error"])
+func (u *UI) rewind(s *core.Session, n int) {
+	u.must(u.app.PreviewRewind(s, n, func(r core.RewindPreview) {
+		if !r.CanRewind {
+			u.app.Notice = "cannot rewind: " + r.Error
 			return
 		}
-		files, _ := r["filesChanged"].([]any)
-		u.ask(fmt.Sprintf("Restore %d file(s) (+%v −%v)? [y/N] ", len(files), r["insertions"], r["deletions"]), "", func(v string) {
-			if !strings.EqualFold(v, "y") {
-				return
+		u.ask(fmt.Sprintf("Restore %d file(s) (+%d −%d)? [y/N] ", r.Files, r.Insertions, r.Deletions), "", func(v string) {
+			if strings.EqualFold(v, "y") {
+				u.must(u.app.Rewind(s, n))
 			}
-			u.must(u.app.call(s, map[string]any{"subtype": "rewind_files", "user_message_id": id}, func(map[string]any) {
-				l := u.app.L(s.SessionID)
-				l.entries = append(l.entries, Entry{Kind: "info", Text: fmt.Sprintf("— files rewound to before turn %d —", n)})
-			}))
 		})
 	}))
 }
 
 func (u *UI) must(err error) {
 	if err != nil {
-		u.app.notice = err.Error()
+		u.app.Notice = err.Error()
 	}
 }
 
@@ -912,9 +885,9 @@ func (u *UI) draw() {
 	x, w := sw+2, W-sw-3
 	scr.HideCursor()
 	s := u.session()
-	var l *Live
+	var l *core.Live
 	if s != nil {
-		u.app.ensureLoaded(s)
+		u.app.EnsureLoaded(s)
 		l = u.app.L(s.SessionID)
 	}
 	bottom, cy, cx := u.bottom(s, l, w)
@@ -1054,9 +1027,9 @@ func (u *UI) drawSidebar(w, h int) {
 			continue
 		}
 		glyph, gst := " ", uv.Style{}
-		switch u.app.status(r.s) {
+		switch u.app.Status(r.s) {
 		case "running":
-			glyph, gst = spinnerFrame(u.app.L(r.s.SessionID).started), fg(th.claude)
+			glyph, gst = spinnerFrame(u.app.L(r.s.SessionID).Started), fg(th.claude)
 		case "waiting":
 			glyph, gst = "?", fg(th.permission)
 		case "error":
@@ -1088,13 +1061,13 @@ func spinnerFrame(start time.Time) string {
 }
 
 // logo is the CLI's welcome header: Clawd, version, model and where the session runs.
-func logo(s *Session, l *Live) []line {
+func logo(s *core.Session, l *core.Live) []line {
 	cl, body, dim := fg(th.claude), uv.Style{Fg: th.claude, Bg: th.logoBg}, fg(th.inactive)
 	ver := ""
-	if l.version != "" {
-		ver = " v" + l.version
+	if l.Version != "" {
+		ver = " v" + l.Version
 	}
-	model := cmp.Or(s.Model, l.model, "default model")
+	model := cmp.Or(s.Model, l.Model, "default model")
 	return []line{
 		ln(span{" ▐", cl}, span{"▛███▛█", body}, span{"   ", uv.Style{}}, span{"Claude Code", uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
 		ln(span{"▝▜", cl}, span{"█████", body}, span{"█▀", cl}, span{"  ", uv.Style{}}, span{model, dim}),
@@ -1102,13 +1075,13 @@ func logo(s *Session, l *Live) []line {
 	}
 }
 
-func (u *UI) transcript(s *Session, l *Live, w int) []line {
+func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	lines := logo(s, l)
 	for i := range lines {
 		lines[i].deco = true
 	}
-	results, tools := map[string]Entry{}, map[string]bool{}
-	for _, e := range l.entries {
+	results, tools := map[string]core.Entry{}, map[string]bool{}
+	for _, e := range l.Entries {
 		switch {
 		case e.ID == "":
 		case e.Kind == "result":
@@ -1119,7 +1092,7 @@ func (u *UI) transcript(s *Session, l *Live, w int) []line {
 	}
 	dim := fg(th.inactive)
 	turn := 0
-	for _, e := range l.entries {
+	for _, e := range l.Entries {
 		if e.Kind == "result" && tools[e.ID] {
 			continue // drawn under its tool call
 		}
@@ -1164,17 +1137,17 @@ func (u *UI) transcript(s *Session, l *Live, w int) []line {
 			lines[first].starts = true
 		}
 	}
-	if l.running && len(l.perms) == 0 {
+	if l.Running && len(l.Perms) == 0 {
 		cl := fg(th.claude)
-		spin := ln(span{spinnerFrame(l.started) + " ", cl}, span{l.verb + "…", cl},
-			span{" (" + fmtDur(time.Since(l.started)) + " · ctrl+c to interrupt)", dim})
+		spin := ln(span{spinnerFrame(l.Started) + " ", cl}, span{l.Verb + "…", cl},
+			span{" (" + core.FormatDuration(time.Since(l.Started)) + " · ctrl+c to interrupt)", dim})
 		spin.deco = true
 		lines = append(lines, line{}, spin)
 	}
 	return lines
 }
 
-func resultLines(e Entry, w int) []line {
+func resultLines(e core.Entry, w int) []line {
 	st := uv.Style{}
 	if e.Err {
 		st = fg(th.error)
@@ -1189,28 +1162,28 @@ func resultLines(e Entry, w int) []line {
 // bottom builds everything under the transcript: task chips, queued messages, the
 // permission dialog or prompt box, and the footer. It returns the cursor row and
 // column within those lines, row -1 when the cursor is hidden.
-func (u *UI) bottom(s *Session, l *Live, w int) ([]line, int, int) {
+func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 	dim := fg(th.inactive)
 	var out []line
 	cy, cx := -1, 0
 	if s != nil {
-		for i, c := range l.chips {
+		for i, c := range l.Chips {
 			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.suggestion)}, nil)...)
 		}
-		if len(l.chips) > 0 {
+		if len(l.Chips) > 0 {
 			out = append(out, ln(span{"  :task <n> to start · :dismiss <n>", dim}))
 		}
-		for _, q := range l.queued {
+		for _, q := range l.Queued {
 			out = append(out, wrap([]span{{q.Text, dim}}, w, span{"❯ ", dim}, nil)...)
 		}
-		if len(l.queued) > 0 {
+		if len(l.Queued) > 0 {
 			out = append(out, ln(span{"  queued · Claude reads it at its next step · x pulls the last one back", dim}))
 		}
-		if len(l.perms) > 0 {
-			out = append(out, u.permLines(l.perms[0], w)...)
+		if len(l.Perms) > 0 {
+			out = append(out, u.permLines(l.Perms[0], w)...)
 		}
 	}
-	if s != nil && (len(l.perms) == 0 || l.perms[0].Answers != nil) {
+	if s != nil && (len(l.Perms) == 0 || l.Perms[0].Answers != nil) {
 		if s.Effort != "" {
 			e := effortGlyphs[s.Effort] + " " + s.Effort + " · :effort"
 			out = append(out, ln(span{strings.Repeat(" ", max(0, w-ansi.StringWidth(e))), uv.Style{}}, span{e, dim}))
@@ -1219,7 +1192,7 @@ func (u *UI) bottom(s *Session, l *Live, w int) ([]line, int, int) {
 		out = append(out, rule)
 		text := u.ed.text
 		caret := uv.Style{}
-		if l.running {
+		if l.Running {
 			caret = dim
 		}
 		// at most 6 rows show; the window follows the cursor
@@ -1269,7 +1242,7 @@ func inputRows(text []rune, w int) []string {
 	return append(rows, string(cur))
 }
 
-func (u *UI) footer(s *Session, w int) []line {
+func (u *UI) footer(s *core.Session, w int) []line {
 	dim := fg(th.inactive)
 	switch {
 	case u.prompt != nil:
@@ -1300,7 +1273,7 @@ func (u *UI) footer(s *Session, w int) []line {
 		left = append(left, span{" · ? for shortcuts", dim})
 	}
 	out := []line{ln(left...)}
-	if n := u.app.notice; n != "" {
+	if n := u.app.Notice; n != "" {
 		if pad := w - width(left) - ansi.StringWidth(n); pad >= 2 {
 			out[0].spans = append(out[0].spans, span{strings.Repeat(" ", pad), uv.Style{}}, span{n, fg(th.warning)})
 		} else {
@@ -1321,32 +1294,11 @@ func (u *UI) footer(s *Session, w int) []line {
 	return out
 }
 
-func branchSuffix(s *Session) string {
+func branchSuffix(s *core.Session) string {
 	if s.Branch != "" {
 		return " ⎇ " + s.Branch
 	}
 	return ""
-}
-
-type question struct {
-	question string
-	options  []string
-}
-
-func questions(p *Perm) []question {
-	var out []question
-	qs, _ := p.Input["questions"].([]any)
-	for _, q := range qs {
-		qm, _ := q.(map[string]any)
-		var opts []string
-		os, _ := qm["options"].([]any)
-		for _, o := range os {
-			om, _ := o.(map[string]any)
-			opts = append(opts, str(om["label"]))
-		}
-		out = append(out, question{str(qm["question"]), opts})
-	}
-	return out
 }
 
 // permOption is one choice in the permission dialog.
@@ -1355,7 +1307,7 @@ type permOption struct {
 	allow, always bool
 }
 
-func permOptions(p *Perm) []permOption {
+func permOptions(p *core.Perm) []permOption {
 	opts := []permOption{{"Yes", true, false}}
 	if len(p.Suggestions) > 0 {
 		opts = append(opts, permOption{alwaysLabel(p.Suggestions[0]), true, true})
@@ -1384,25 +1336,25 @@ func alwaysLabel(sug any) string {
 }
 
 // permLines draws the CLI-style permission dialog, or an AskUserQuestion card.
-func (u *UI) permLines(p *Perm, w int) []line {
+func (u *UI) permLines(p *core.Perm, w int) []line {
 	dim, perm := fg(th.inactive), fg(th.permission)
 	out := []line{ln(span{strings.Repeat("─", w), perm})}
 	if p.Answers != nil {
-		qs := questions(p)
+		qs := p.Questions()
 		if len(p.Answers) >= len(qs) {
 			return nil
 		}
 		q := qs[len(p.Answers)]
-		out = append(out, wrap([]span{{q.question, uv.Style{Attrs: uv.AttrBold}}}, w, span{fmt.Sprintf(" (%d/%d) ", len(p.Answers)+1, len(qs)), dim}, nil)...)
-		for i, o := range q.options {
+		out = append(out, wrap([]span{{q.Question, uv.Style{Attrs: uv.AttrBold}}}, w, span{fmt.Sprintf(" (%d/%d) ", len(p.Answers)+1, len(qs)), dim}, nil)...)
+		for i, o := range q.Options {
 			out = append(out, ln(span{fmt.Sprintf("   %d. ", i+1), dim}, span{o, uv.Style{}}))
 		}
 		return append(out, line{}, ln(span{" i, then type a number or your own answer · enter to submit", dim}))
 	}
-	title, body := p.Tool, summariseInput(p.Input)
+	title, body := p.Tool, core.SummariseInput(p.Input)
 	switch p.Tool {
 	case "Bash":
-		title, body = "Bash command", firstLines(str(p.Input["command"]), 8)
+		title, body = "Bash command", core.FirstLines(str(p.Input["command"]), 8)
 	case "Edit", "MultiEdit", "NotebookEdit":
 		title = "Edit file"
 	case "Write":
@@ -1410,7 +1362,7 @@ func (u *UI) permLines(p *Perm, w int) []line {
 	case "Read":
 		title = "Read file"
 	case "ExitPlanMode":
-		title, body = "Ready to code?", firstLines(str(p.Input["plan"]), 12)
+		title, body = "Ready to code?", core.FirstLines(str(p.Input["plan"]), 12)
 	}
 	out = append(out, ln(span{" " + title, with(perm, uv.AttrBold)}))
 	if d := str(p.Input["description"]); d != "" {
@@ -1446,6 +1398,15 @@ func cursorXY(before []rune, w int) (int, int) {
 	}
 	return x, y
 }
+
+func shortPath(p string) string {
+	if home, _ := os.UserHomeDir(); home != "" && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
+func str(v any) string { s, _ := v.(string); return s }
 
 func indexStr(xs []string, s string) int {
 	for i, x := range xs {

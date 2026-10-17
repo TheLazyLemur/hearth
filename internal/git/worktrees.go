@@ -1,4 +1,4 @@
-package main
+package git
 
 import (
 	"fmt"
@@ -6,7 +6,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"claude-code-tui/internal/core"
+	"claude-code-tui/pkg/random"
 )
+
+var _ core.Worktrees = Worktrees{}
+
+type Worktrees struct{}
 
 func git(dir string, args ...string) (string, error) {
 	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -16,33 +23,37 @@ func git(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// createWorktree mirrors the desktop layout: <repo>/.claude/worktrees/<slug>-<hex>
-// on branch claude/<slug>-<hex>, cut from HEAD. Returns the cwd to run in
-// (the origin's sub-path inside the new worktree).
-func createWorktree(s *Session, prompt string) error {
-	root, err := git(s.OriginCwd, "rev-parse", "--show-toplevel")
+func (Worktrees) IsRepo(dir string) bool {
+	_, err := git(dir, "rev-parse", "--show-toplevel")
+	return err == nil
+}
+
+// Create mirrors the desktop layout: <repo>/.claude/worktrees/<slug>-<hex>
+// on branch claude/<slug>-<hex>, cut from HEAD. The worktree's Cwd is the
+// origin's sub-path inside it.
+func (Worktrees) Create(originCwd, prompt string) (core.Worktree, error) {
+	root, err := git(originCwd, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return err
+		return core.Worktree{}, err
 	}
 	src, _ := git(root, "rev-parse", "--abbrev-ref", "HEAD")
-	name := slugify(prompt) + "-" + randomHex(6)
+	name := slugify(prompt) + "-" + random.Hex(6)
 	path := filepath.Join(root, ".claude", "worktrees", name)
 	branch := "claude/" + name
 	if _, err := git(root, "worktree", "add", "-b", branch, path, "HEAD"); err != nil {
-		return err
+		return core.Worktree{}, err
 	}
-	rel, err := filepath.Rel(root, s.OriginCwd)
+	rel, err := filepath.Rel(root, originCwd)
 	if err != nil {
-		return err
+		return core.Worktree{}, err
 	}
-	s.Cwd, s.WorktreePath, s.WorktreeName, s.Branch, s.SourceBranch = filepath.Join(path, rel), path, name, branch, src
-	return nil
+	return core.Worktree{Cwd: filepath.Join(path, rel), Path: path, Name: name, Branch: branch, SourceBranch: src}, nil
 }
 
-// removeWorktree never forces: git refuses when the worktree has uncommitted
+// Remove never forces: git refuses when the worktree has uncommitted
 // changes, so deleting a session can't silently destroy work. The branch is kept.
-func removeWorktree(s *Session) error {
-	_, err := git(s.OriginCwd, "worktree", "remove", s.WorktreePath)
+func (Worktrees) Remove(originCwd, path string) error {
+	_, err := git(originCwd, "worktree", "remove", path)
 	return err
 }
 

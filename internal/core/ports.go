@@ -1,0 +1,108 @@
+package core
+
+import "time"
+
+// SessionStore persists session records.
+type SessionStore interface {
+	Load() ([]*Session, error)
+	Save(s *Session) error
+	Delete(id string) error // os.ErrNotExist when there is nothing to delete
+}
+
+// Transcripts reads a session's conversation history from the agent's own record.
+type Transcripts interface {
+	Load(cwd, cliSessionID string) ([]Entry, error)
+}
+
+// Worktree is an isolated checkout a session runs in.
+type Worktree struct{ Cwd, Path, Name, Branch, SourceBranch string }
+
+type Worktrees interface {
+	IsRepo(dir string) bool
+	// Create cuts a worktree from HEAD of the repo holding originCwd, named after prompt.
+	Create(originCwd, prompt string) (Worktree, error)
+	// Remove must refuse a worktree with uncommitted changes.
+	Remove(originCwd, path string) error
+}
+
+// Launcher starts an agent for s; the agent reports on out until it sends Exited.
+type Launcher interface {
+	Start(s *Session, out chan<- AgentEvent) (Agent, error)
+}
+
+// Agent is one running Claude Code. Methods returning a string send a request
+// whose Reply arrives later as an event carrying that request id.
+type Agent interface {
+	// SendUser may be called mid-turn: the agent queues the message and reports
+	// Consumed with this uuid once it reads it.
+	SendUser(text, uuid string) error
+	Interrupt() string
+	CancelQueued(uuid string) string
+	SetPermissionMode(mode string) string
+	SetModel(model string) string
+	SetEffort(effort string) string
+	Rename(title string) string
+	GenerateTitle(description string) string
+	Rewind(userMessageID string, dryRun bool) string
+	Allow(requestID string, input map[string]any, permissions []any) error
+	Deny(requestID, message string) error
+	Close()
+}
+
+// AgentEvent is one thing a session's agent reported.
+type AgentEvent struct {
+	SessionID string
+	Event     Event
+}
+
+// Event is one of the types below.
+type Event interface{ event() }
+
+type (
+	Initialized      struct{ Version, Model, CLISessionID string }
+	Compacted        struct{}
+	TextDelta        struct{ Text string }
+	AssistantMessage struct{ Entries []Entry }
+	UserMessage      struct{ Entries []Entry }
+	// Consumed: the agent read a queued user message.
+	Consumed  struct{ UUID string }
+	TurnEnded struct {
+		OK       bool
+		Duration time.Duration
+		Failure  string // why the turn failed, when !OK
+	}
+	PermissionRequested struct{ Perm *Perm }
+	PermissionCancelled struct{ RequestID string }
+	// TaskSuggested and TaskDismissed must be answered once through Reply.
+	TaskSuggested struct {
+		Chip  Chip
+		Reply func(text string, isErr bool)
+	}
+	TaskDismissed struct {
+		TaskID string
+		Reply  func(text string, isErr bool)
+	}
+	// Reply answers the request with RequestID; only the fields for that request are set.
+	Reply struct {
+		RequestID string
+		Err       string
+		Cancelled bool   // CancelQueued
+		Title     string // GenerateTitle
+		Rewind    RewindPreview
+	}
+	Exited struct{ Err error }
+)
+
+func (Initialized) event()         {}
+func (Compacted) event()           {}
+func (TextDelta) event()           {}
+func (AssistantMessage) event()    {}
+func (UserMessage) event()         {}
+func (Consumed) event()            {}
+func (TurnEnded) event()           {}
+func (PermissionRequested) event() {}
+func (PermissionCancelled) event() {}
+func (TaskSuggested) event()       {}
+func (TaskDismissed) event()       {}
+func (Reply) event()               {}
+func (Exited) event()              {}
