@@ -49,7 +49,8 @@ func cliArgs(s *core.Session) []string {
 	for _, t := range core.Tools {
 		allowed = append(allowed, "mcp__"+mcpServerName+"__"+t["name"].(string))
 	}
-	args = append(args, "--allowedTools", strings.Join(allowed, ","))
+	// The built-in Agent tool is off: subagents are hearth sessions started with start_agent.
+	args = append(args, "--allowedTools", strings.Join(allowed, ","), "--disallowedTools", "Agent")
 	if s.Model != "" {
 		args = append(args, "--model", s.Model)
 	}

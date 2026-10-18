@@ -54,12 +54,13 @@ func entries(msg map[string]any) []core.Entry {
 	var out []core.Entry
 	switch msg["role"] {
 	case "user":
-		if s, ok := msg["content"].(string); ok {
-			return []core.Entry{{Kind: "user", Text: s}}
+		if s, ok := msg["content"].(string); ok { // as one text block
+			msg = map[string]any{"content": []any{map[string]any{"type": "text", "text": s}}}
 		}
 		for _, b := range blocks(msg) {
-			if b["type"] == "text" {
-				out = append(out, core.Entry{Kind: "user", Text: str(b["text"])})
+			// an agent's report is hearth's message to the agent, not the user's
+			if t := str(b["text"]); b["type"] == "text" && !strings.HasPrefix(t, "<agent-report ") {
+				out = append(out, core.Entry{Kind: "user", Text: t})
 			}
 		}
 	case "assistant":
