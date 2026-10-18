@@ -42,7 +42,8 @@ tools, appended prompt text, injected messages); the CLI has no feature for it.
 ### Tools (`core.Tools`, so every backend gets them)
 
 - `start_agent` (shipped): Claude Code-style subagents on this core, replacing Claude's built-in Agent
-  tool. The agent shares the parent's checkout, backend, model, effort and mode. Each of its turns
+  tool. The agent shares the parent's checkout and mode, and by default its backend, model and effort;
+  the model can pick any listed backend, model and effort instead. Each of its turns
   the user didn't start is relayed as an `<agent-report>` message (completed, failed, stopped) that
   steers a running parent or wakes an idle one. Depth 3, 20 at once: Claude Code's defaults.
 - `start_session`: `initiation` `user_asked` first; `context` fresh (prompt plus background) or fork;

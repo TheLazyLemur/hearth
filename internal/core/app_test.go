@@ -279,3 +279,141 @@ func TestParentHearsWhenItsAgentExitsMidTurn(t *testing.T) {
 		t.Fatalf("parent sent %q", parentAgent.sent)
 	}
 }
+
+// listed delivers each backend's model list, as hearth's startup listing would.
+func listed(a *App, claude, pi []Model) {
+	a.Handle(AgentEvent{Event: ModelsListed{Backend: DefaultBackend, Models: claude}})
+	a.Handle(AgentEvent{Event: ModelsListed{Backend: "pi", Models: pi}})
+}
+
+// startAgent calls start_agent for parent and returns its reply.
+func startAgent(a *App, parent *Session, args map[string]any) (reply string, isErr bool) {
+	a.Handle(AgentEvent{parent.SessionID, CallTool("start_agent", args, func(text string, e bool) { reply, isErr = text, e })})
+	return reply, isErr
+}
+
+func TestStartupListingPutsEveryBackendsModelsInTheAgentTool(t *testing.T) {
+	// given
+	// ... each backend offers one model
+	a, f := testApp(t)
+	f.launcher.models = []Model{{ID: "opus", Name: "Opus", Efforts: []string{"low", "high"}}}
+	f.piLauncher.models = []Model{{ID: "ollama/flash", Name: "Flash"}}
+	a.ListModels("/repo")
+	a.Handle(<-a.Events())
+	a.Handle(<-a.Events())
+
+	// when
+	// ... a session launches
+	a.Send(a.NewSession("/repo", false), "hi")
+
+	// then
+	// ... its start_agent description lists both backends' models with their effort levels
+	desc := f.launcher.tools[2]["description"].(string)
+	if !strings.Contains(desc, "claude: opus (Opus), effort low|high") || !strings.Contains(desc, "pi: ollama/flash (Flash), no effort setting") {
+		t.Fatalf("description %q", desc)
+	}
+}
+
+func TestAgentRunsOnTheBackendModelAndEffortItAsksFor(t *testing.T) {
+	// given
+	// ... a Claude session and a pi model with two effort levels
+	a, f := testApp(t)
+	listed(a, nil, []Model{{ID: "ollama/flash", Efforts: []string{"low", "high"}}})
+	parent := a.NewSession("/repo", false)
+	withAgent(a, parent)
+
+	// when
+	// ... it starts an agent on that pi model at low effort
+	reply, isErr := startAgent(a, parent, map[string]any{"title": "Search", "prompt": "Find x.", "backend": "pi", "model": "ollama/flash", "effort": "low"})
+
+	// then
+	// ... the agent runs on pi with that model and effort, and the reply says so
+	child := a.sessions[0]
+	if isErr || child.Backend != "pi" || child.Model != "ollama/flash" || child.Effort != "low" || len(f.piLauncher.agents) != 1 ||
+		!strings.Contains(reply, "on pi, model ollama/flash, effort low") {
+		t.Fatalf("reply %q %v child %+v", reply, isErr, child)
+	}
+}
+
+func TestAgentKeepsTheParentsEffortOnlyWhenItsModelHasIt(t *testing.T) {
+	// given
+	// ... a session at xhigh effort, and pi models with and without xhigh
+	a, _ := testApp(t)
+	listed(a, nil, []Model{{ID: "ollama/big", Efforts: []string{"high", "xhigh"}}, {ID: "ollama/small", Efforts: []string{"low", "high"}}})
+	parent := a.NewSession("/repo", false)
+	a.SetEffort(parent, "xhigh")
+	withAgent(a, parent)
+
+	// when
+	// ... it starts one agent on each model without naming an effort
+	startAgent(a, parent, map[string]any{"title": "Big", "prompt": "x", "backend": "pi", "model": "ollama/big"})
+	startAgent(a, parent, map[string]any{"title": "Small", "prompt": "x", "backend": "pi", "model": "ollama/small"})
+
+	// then
+	// ... the model with xhigh keeps it, and the other uses its default
+	big, small := a.sessions[1], a.sessions[0]
+	if big.Effort != "xhigh" || small.Effort != "" {
+		t.Fatalf("big %q small %q", big.Effort, small.Effort)
+	}
+}
+
+func TestAgentOnABackendAloneUsesThatBackendsDefaultModel(t *testing.T) {
+	// given
+	// ... a Claude session on opus at high effort
+	a, _ := testApp(t)
+	listed(a, []Model{{ID: "opus", Efforts: []string{"high"}}}, nil)
+	parent := a.NewSession("/repo", false)
+	a.SetModel(parent, "opus")
+	a.SetEffort(parent, "high")
+	withAgent(a, parent)
+
+	// when
+	// ... it starts an agent naming only the pi backend
+	startAgent(a, parent, map[string]any{"title": "Search", "prompt": "x", "backend": "pi"})
+
+	// then
+	// ... the agent runs on pi's default model, at its default effort
+	child := a.sessions[0]
+	if child.Backend != "pi" || child.Model != "" || child.Effort != "" {
+		t.Fatalf("child %+v", child)
+	}
+}
+
+func TestStartAgentRefusesWhatItCannotHonour(t *testing.T) {
+	flash := []Model{{ID: "ollama/flash", Efforts: []string{"low", "high"}}}
+	cases := []struct {
+		name   string
+		lists  func(a *App)
+		args   map[string]any
+		reason string
+	}{
+		{"unknown backend", func(a *App) { listed(a, nil, flash) }, map[string]any{"backend": "gemini"}, "unknown backend \"gemini\"; choose one of: claude, pi"},
+		{"unknown model", func(a *App) { listed(a, nil, flash) }, map[string]any{"backend": "pi", "model": "ollama/nope"}, "pi has no model \"ollama/nope\"; choose one of: ollama/flash"},
+		{"unsupported effort", func(a *App) { listed(a, nil, flash) }, map[string]any{"backend": "pi", "model": "ollama/flash", "effort": "max"}, "ollama/flash has no effort \"max\"; choose one of: low, high"},
+		{"lists loading", func(a *App) { a.ListModels("/repo") }, map[string]any{"backend": "pi", "model": "ollama/flash"}, "model lists are still loading"},
+		{"listing failed", func(a *App) {
+			a.Handle(AgentEvent{Event: ModelsListed{Backend: "pi", Err: errors.New("exec: pi not found")}})
+		}, map[string]any{"backend": "pi", "model": "ollama/flash"}, "pi is not available: listing models: exec: pi not found"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a session and the model lists of this case
+			a, _ := testApp(t)
+			c.lists(a)
+			parent := a.NewSession("/repo", false)
+			withAgent(a, parent)
+			c.args["title"], c.args["prompt"] = "Task", "Do x."
+
+			// when
+			// ... it asks for an agent hearth cannot honour
+			reply, isErr := startAgent(a, parent, c.args)
+
+			// then
+			// ... the call is refused with the reason, and no agent starts
+			if !isErr || !strings.Contains(reply, c.reason) || len(a.sessions) != 1 {
+				t.Fatalf("reply %q %v sessions %d", reply, isErr, len(a.sessions))
+			}
+		})
+	}
+}

@@ -41,13 +41,15 @@ func (f *fakeWorktrees) Remove(originCwd, path string) error { return f.removeEr
 type fakeLauncher struct {
 	agents []*fakeAgent
 	models []Model
-	lists  int // Models calls
+	lists  int              // Models calls
+	tools  []map[string]any // the tools the latest Start was given
 }
 
 func (f *fakeLauncher) Models(cwd string) ([]Model, error) { f.lists++; return f.models, nil }
 
-func (f *fakeLauncher) Start(s *Session, out chan<- AgentEvent) (Agent, error) {
+func (f *fakeLauncher) Start(s *Session, tools []map[string]any, out chan<- AgentEvent) (Agent, error) {
 	ag := &fakeAgent{}
+	f.tools = tools
 	f.agents = append(f.agents, ag)
 	return ag, nil
 }

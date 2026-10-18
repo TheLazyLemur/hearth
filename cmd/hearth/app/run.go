@@ -47,5 +47,6 @@ func Run() error {
 	if err != nil {
 		return fmt.Errorf("load sessions: %w", err)
 	}
+	app.ListModels(launched)
 	return tui.Run(app, launched)
 }
