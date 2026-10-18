@@ -53,7 +53,7 @@ func TestInlineMarkdownWrapsUnderItsMarker(t *testing.T) {
 	if strings.Join(got, "|") != "⏺ Title|  see go.mod |  for deps ok" {
 		t.Fatalf("rows %q", got)
 	}
-	if styles["go.mod"].Fg != th.permission || styles["deps"].Attrs != uv.AttrBold || styles["Title"].Attrs != uv.AttrBold|uv.AttrItalic {
+	if styles["go.mod"].Fg != th.accent || styles["deps"].Attrs != uv.AttrBold || styles["Title"].Attrs != uv.AttrBold|uv.AttrItalic {
 		t.Fatalf("styles %+v", styles)
 	}
 }

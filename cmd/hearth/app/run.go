@@ -34,8 +34,6 @@ func Run() error {
 		}
 	}
 	claudeConfig := cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), filepath.Join(home, ".claude"))
-	// the CLI keeps .claude.json beside ~/.claude unless CLAUDE_CONFIG_DIR moves both
-	claudeJSON := filepath.Join(cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), home), ".claude.json")
 
 	app, err := core.NewApp(store.Store{Dir: filepath.Join(hearthHome, "sessions")}, map[string]core.Backend{
 		core.DefaultBackend: {Label: "Claude Code", Tag: "cl", Rewind: true, Unqueue: true,
@@ -49,5 +47,5 @@ func Run() error {
 	if err != nil {
 		return fmt.Errorf("load sessions: %w", err)
 	}
-	return tui.Run(app, launched, claudeJSON)
+	return tui.Run(app, launched)
 }

@@ -303,7 +303,7 @@ func (u *UI) drawPicker(W, H int) {
 	}
 	u.box(x0, y0, lw, h, title)
 	u.box(x0+lw, y0, w-lw, h, "")
-	u.drawLine(x0+2, y0+1, lw-4, ln(span{"> ", fg(th.permission)}, span{string(p.query), uv.Style{}}))
+	u.drawLine(x0+2, y0+1, lw-4, ln(span{"> ", fg(th.accent)}, span{string(p.query), uv.Style{}}))
 	rows := h - 5 // query, gap, the list, count
 	top := max(0, p.sel-rows+1)
 	for i := 0; i < rows && top+i < len(p.items); i++ {
@@ -342,7 +342,7 @@ func (u *UI) pickRow(it pickItem, sel bool) line {
 	if sel {
 		caret, base = "❯ ", uv.Style{Attrs: uv.AttrBold}
 	}
-	sp := []span{{caret, fg(th.permission)}}
+	sp := []span{{caret, fg(th.accent)}}
 	var tag span
 	if u.pick.grep {
 		t := ansi.Truncate(cmp.Or(it.s.Title, "New session"), 18, "…")
@@ -358,7 +358,7 @@ func (u *UI) pickRow(it pickItem, sel bool) line {
 			st = fg(th.inactive)
 		}
 		if slices.Contains(it.hits, i) {
-			st = uv.Style{Fg: th.claude, Attrs: uv.AttrBold}
+			st = uv.Style{Fg: th.accent, Attrs: uv.AttrBold}
 		}
 		if n := len(sp); sp[n-1].st.Equal(&st) {
 			sp[n-1].t += string(r)
@@ -395,7 +395,7 @@ func (u *UI) statusGlyph(s *core.Session) (string, uv.Style) {
 	case "running":
 		return ember(u.app.L(s.SessionID).Started)
 	case "waiting":
-		return "?", fg(th.permission)
+		return "?", fg(th.accent)
 	case "error":
 		return "✗", fg(th.error)
 	}

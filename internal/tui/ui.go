@@ -22,7 +22,6 @@ import (
 var (
 	modes   = []string{"default", "acceptEdits", "plan", "auto"}
 	efforts = []string{"", "low", "medium", "high", "xhigh", "max"}
-	th      = themes["dark"]
 )
 
 const (
@@ -126,16 +125,16 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
-	launched     string  // default folder for new sessions
-	pick         *picker // the open session or grep picker
+	launched     string      // default folder for new sessions
+	pick         *picker     // the open session or grep picker
 	ambient      color.Color // background for draws that set none: the sidebar or card being painted
-	lead         bool    // the last key was a lone space: the start of a picker chord
-	jump         int     // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	lead         bool        // the last key was a lone space: the start of a picker chord
+	jump         int         // entry+1 to put the transcript cursor on at the next draw (grep hits)
 }
 
 // Run drives app from the terminal until the user quits. launched is the
-// default folder for new sessions; claudeJSON is the CLI's settings file, for the theme.
-func Run(app *core.App, launched, claudeJSON string) error {
+// default folder for new sessions.
+func Run(app *core.App, launched string) error {
 	t := uv.DefaultTerminal()
 	scr := t.Screen()
 	scr.EnterAltScreen()
@@ -143,7 +142,6 @@ func Run(app *core.App, launched, claudeJSON string) error {
 	if err := t.Start(); err != nil {
 		return err
 	}
-	th = loadTheme(claudeJSON)
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
 	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
@@ -523,7 +521,7 @@ func (u *UI) choiceLines() []line {
 		}
 		mark, st := "  ", uv.Style{}
 		if c.value == picked && !marked {
-			mark, st, marked = "❯ ", fg(th.permission), true
+			mark, st, marked = "❯ ", fg(th.accent), true
 		}
 		out = append(out, ln(span{mark, st}, span{fmt.Sprintf("%d. ", i+1), dim}, span{c.label, st}))
 		if len(out) == 10 {
@@ -940,7 +938,7 @@ func inline(l string, st uv.Style) []span {
 		if i < 0 {
 			break
 		}
-		mark, inner := "`", uv.Style{Fg: th.permission, Bg: st.Bg, Attrs: st.Attrs}
+		mark, inner := "`", uv.Style{Fg: th.accent, Bg: st.Bg, Attrs: st.Attrs}
 		if l[i] == '*' {
 			if !strings.HasPrefix(l[i:], "**") {
 				out, l = append(out, span{l[:i+1], st}), l[i+1:]
@@ -1025,7 +1023,7 @@ func (u *UI) draw() {
 	if s == nil {
 		msg := "no sessions · o to start one, or :e <folder>"
 		cy := top / 2
-		u.put(x+(w-4)/2, cy-1, 4, " 炉 ", uv.Style{Fg: th.text, Bg: th.claude, Attrs: uv.AttrBold})
+		u.put(x+(w-4)/2, cy-1, 4, " 炉 ", uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold})
 		u.put(x+(w-ansi.StringWidth(msg))/2, cy+1, w, msg, fg(th.inactive))
 	} else {
 		lines := u.transcript(s, l, w)
@@ -1157,7 +1155,7 @@ func (u *UI) drawSidebar(w, h int) {
 		} else if sel {
 			bar, st = "▎", uv.Style{}
 		}
-		u.put(0, y, 1, bar, fg(th.claude))
+		u.put(0, y, 1, bar, fg(th.accent))
 		if r.s == nil {
 			if !sel {
 				st = fg(th.inactive)
@@ -1199,7 +1197,7 @@ func (u *UI) header(s *core.Session, l *core.Live) []line {
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
 	return []line{
-		ln(span{" 炉 ", uv.Style{Fg: th.text, Bg: th.claude, Attrs: uv.AttrBold}}, span{"   ", uv.Style{}},
+		ln(span{" 炉 ", uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold}}, span{"   ", uv.Style{}},
 			span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)},
 			span{" · " + model + " · " + shortPath(s.Cwd) + branchSuffix(s), dim}),
 	}
@@ -1301,7 +1299,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 	cy, cx := -1, 0
 	if s != nil {
 		for i, c := range l.Chips {
-			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.suggestion)}, nil)...)
+			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.inactive)}, nil)...)
 		}
 		if len(l.Chips) > 0 {
 			out = append(out, ln(span{"  :task <n> to start · :dismiss <n>", dim}))
@@ -1325,7 +1323,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 			e := effortGlyphs[s.Effort] + " " + s.Effort + " · :effort"
 			out = append(out, ln(span{strings.Repeat(" ", max(0, w-ansi.StringWidth(e))), uv.Style{}}, span{e, dim}))
 		}
-		rule := ln(span{strings.Repeat("─", w), fg(th.promptBorder)})
+		rule := ln(span{strings.Repeat("─", w), fg(th.subtle)})
 		out = append(out, rule)
 		text := u.ed.text
 		caret := uv.Style{}
@@ -1399,11 +1397,11 @@ func (u *UI) footer(s *core.Session, w int) []line {
 	if s != nil {
 		switch s.PermissionMode { // manual is the default and says nothing
 		case "acceptEdits":
-			left = append(left, span{" · accept edits", fg(th.autoAccept)})
+			left = append(left, span{" · accept edits", fg(th.accent)})
 		case "plan":
-			left = append(left, span{" · plan", fg(th.planMode)})
+			left = append(left, span{" · plan", fg(th.accent)})
 		case "auto":
-			left = append(left, span{" · auto", fg(th.autoAccept)})
+			left = append(left, span{" · auto", fg(th.accent)})
 		}
 	}
 	if vim == "normal" {
@@ -1474,7 +1472,7 @@ func alwaysLabel(sug any) string {
 
 // permLines draws the CLI-style permission dialog, or an AskUserQuestion card.
 func (u *UI) permLines(p *core.Perm, w int) []line {
-	dim, perm := fg(th.inactive), fg(th.permission)
+	dim, perm := fg(th.inactive), fg(th.accent)
 	out := []line{ln(span{strings.Repeat("─", w), perm})}
 	if p.Answers != nil {
 		qs := p.Questions()
