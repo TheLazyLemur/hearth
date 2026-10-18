@@ -8,14 +8,14 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 )
 
-// th is hearth's palette, sumi: ink greys, washi text, one shu (vermilion) accent.
+// th is hearth's palette: cool blue-black inks that sit on a near-black terminal, one shu (vermilion) accent.
 var th = struct {
 	accent, text, inactive, subtle, success, error, warning, userBg color.Color
-	card                                                            color.Color // floating-card tint
+	panel                                                           color.Color // sidebar and picker-card tint
 }{
-	accent: rgb(206, 78, 54), text: rgb(228, 222, 210), inactive: rgb(122, 118, 111), subtle: rgb(58, 56, 53),
+	accent: rgb(206, 78, 54), text: rgb(214, 222, 232), inactive: rgb(104, 114, 134), subtle: rgb(46, 52, 68),
 	success: rgb(128, 146, 108), error: rgb(196, 92, 80), warning: rgb(178, 150, 106),
-	userBg: rgb(38, 37, 35), card: rgb(30, 29, 27),
+	userBg: rgb(22, 27, 40), panel: rgb(11, 14, 22),
 }
 
 func rgb(r, g, b uint8) color.Color { return color.RGBA{r, g, b, 255} }

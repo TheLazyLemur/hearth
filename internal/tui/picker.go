@@ -295,7 +295,7 @@ func (u *UI) drawPicker(W, H int) {
 	w, h := min(W-4, 140), min(H-2, 32)
 	x0, y0 := (W-w)/2, (H-h)/2
 	lw := w * 2 / 5
-	u.ambient = th.card
+	u.ambient = th.panel
 	defer func() { u.ambient = nil }()
 	title := "sessions"
 	if p.grep {
@@ -329,7 +329,7 @@ func (u *UI) drawPicker(W, H int) {
 	u.scr.ShowCursor()
 }
 
-// box clears a w×h rectangle to the ambient card colour, title in its bottom-right corner.
+// box clears a w×h rectangle to the ambient panel colour, title in its bottom-right corner.
 func (u *UI) box(x, y, w, h int, title string) {
 	for r := 0; r < h; r++ {
 		u.put(x, y+r, w, strings.Repeat(" ", w), uv.Style{})
