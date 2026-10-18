@@ -34,6 +34,18 @@ type Backend struct {
 	Rewind, Unqueue bool
 }
 
+// Caps is the part of a Backend clients hold: they send the commands, the process running
+// the harness answers them.
+type Caps struct {
+	Label   string `json:"label"`
+	Tag     string `json:"tag"`
+	Rewind  bool   `json:"rewind"`
+	Unqueue bool   `json:"unqueue"`
+}
+
+// Caps strips b to the part clients hold.
+func (b Backend) Caps() Caps { return Caps{b.Label, b.Tag, b.Rewind, b.Unqueue} }
+
 // DefaultBackend runs new sessions, and the sessions saved before there was a choice.
 const DefaultBackend = "claude"
 

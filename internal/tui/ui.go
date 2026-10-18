@@ -103,7 +103,7 @@ func groupRows(vs []*core.Session, collapsed map[string]bool) []row {
 }
 
 type UI struct {
-	app          *core.App
+	app          Client
 	scr          *uv.TerminalScreen
 	ctx          *screen.Context
 	pane         int
@@ -132,9 +132,11 @@ type UI struct {
 	jump         int     // entry+1 to put the transcript cursor on at the next draw (grep hits)
 }
 
-// Run drives app from the terminal until the user quits. launched is the
-// default folder for new sessions; claudeJSON is the CLI's settings file, for the theme.
-func Run(app *core.App, launched, claudeJSON string) error {
+// Run drives a daemon's app from the terminal until the user quits; quitting only detaches,
+// so the daemon and its agents keep running. launched is the default folder for new
+// sessions; claudeJSON is the CLI's settings file, for the theme.
+func Run(app Client, launched, claudeJSON string) error {
+	th = loadTheme(claudeJSON)
 	t := uv.DefaultTerminal()
 	scr := t.Screen()
 	scr.EnterAltScreen()
@@ -142,7 +144,6 @@ func Run(app *core.App, launched, claudeJSON string) error {
 	if err := t.Start(); err != nil {
 		return err
 	}
-	th = loadTheme(claudeJSON)
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
 	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
@@ -150,20 +151,22 @@ func Run(app *core.App, launched, claudeJSON string) error {
 		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
 	}
 	defer func() {
-		app.CloseAll()
+		u.app.Close()
 		t.Stop()
 	}()
 	for !u.quit {
+		fresh := u.app.Drain() // what the daemon or another instance changed
 		select {
+		case <-u.app.Closed():
+			// it died or dropped us for falling behind; there is no reconnecting from here
+			return u.app.Err()
 		case ev, ok := <-t.Events():
 			if !ok {
 				return nil
 			}
 			u.event(ev)
-		case m := <-app.Events():
-			app.Handle(m)
 		case <-tick.C:
-			if !app.AnyRunning() {
+			if !fresh && !u.app.AnyRunning() {
 				continue
 			}
 		}
@@ -232,7 +235,7 @@ func (u *UI) event(ev uv.Event) {
 			u.ed.insertText([]rune(text))
 		}
 	case uv.KeyPressEvent:
-		u.app.Notice = ""
+		u.app.SetNotice("")
 		u.key(ev)
 	}
 }
@@ -249,7 +252,7 @@ func (u *UI) key(k uv.KeyPressEvent) {
 		if s != nil && u.app.Status(s) == "running" {
 			u.app.Interrupt(s)
 		} else {
-			u.app.Notice = "type :q to quit"
+			u.app.SetNotice("type :q to quit")
 		}
 		return
 	}
@@ -436,7 +439,8 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 	}
 	act := tv.handleKey(u.slines, u.view, &u.register, char, key)
 	if tv.note != "" {
-		u.app.Notice, tv.note = tv.note, ""
+		u.app.SetNotice(tv.note)
+		tv.note = ""
 	}
 	switch act {
 	case viewInsert:
@@ -450,7 +454,7 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 	case viewCommand:
 		u.ask(":", "", u.command)
 	case viewQuit:
-		u.app.Notice = "type :q to quit"
+		u.app.SetNotice("type :q to quit")
 	}
 }
 
@@ -476,7 +480,7 @@ func (u *UI) submit(s *core.Session, interrupt bool) {
 		err = u.app.Send(s, text)
 	}
 	if err != nil {
-		u.app.Notice = err.Error()
+		u.app.SetNotice(err.Error())
 		return
 	}
 	u.ed.reset()
@@ -551,10 +555,10 @@ func (u *UI) yanked() {
 	cmd := exec.Command("pbcopy")
 	cmd.Stdin = strings.NewReader(string(u.register))
 	if err := cmd.Run(); err != nil {
-		u.app.Notice = "yanked; clipboard: " + err.Error()
+		u.app.SetNotice("yanked; clipboard: " + err.Error())
 		return
 	}
-	u.app.Notice = fmt.Sprintf("yanked %d characters", len(u.register))
+	u.app.SetNotice(fmt.Sprintf("yanked %d characters", len(u.register)))
 }
 
 // cardKey drives the permission dialog: j/k or arrows and enter, a number, or esc to deny.
@@ -632,7 +636,7 @@ func (u *UI) command(line string) {
 		return
 	}
 	if s == nil {
-		u.app.Notice = "no session"
+		u.app.SetNotice("no session")
 		return
 	}
 	n, nerr := strconv.Atoi(arg)
@@ -653,13 +657,13 @@ func (u *UI) command(line string) {
 			valid = efforts[1:]
 		}
 		if arg != "" && indexStr(valid, arg) < 0 {
-			u.app.Notice = "effort: " + strings.Join(valid, "|")
+			u.app.SetNotice("effort: " + strings.Join(valid, "|"))
 			return
 		}
 		u.app.SetEffort(s, arg)
 	case "mode":
 		if indexStr(modes, arg) < 0 {
-			u.app.Notice = "mode: " + strings.Join(modes, "|")
+			u.app.SetNotice("mode: " + strings.Join(modes, "|"))
 			return
 		}
 		u.app.SetMode(s, arg)
@@ -667,15 +671,15 @@ func (u *UI) command(line string) {
 		u.must(u.app.SetBackend(s, arg))
 	case "rewind":
 		if nerr != nil {
-			u.app.Notice = "usage: :rewind <turn number>"
+			u.app.SetNotice("usage: :rewind <turn number>")
 			return
 		}
 		u.rewind(s, n)
 	case "task":
 		if ns, err := u.app.AcceptChip(s, n-1); err != nil {
-			u.app.Notice = err.Error()
+			u.app.SetNotice(err.Error())
 		} else {
-			u.app.Notice = "started task in background: " + ns.Title
+			u.app.SetNotice("started task in background: " + ns.Title)
 		}
 	case "dismiss":
 		u.app.DismissChip(s, n-1)
@@ -688,7 +692,7 @@ func (u *UI) command(line string) {
 	case "delete":
 		u.confirmDelete(s)
 	default:
-		u.app.Notice = "not a command: " + name
+		u.app.SetNotice("not a command: " + name)
 	}
 }
 
@@ -696,7 +700,7 @@ func (u *UI) confirmDelete(s *core.Session) {
 	u.ask(fmt.Sprintf("Delete %q? [y/N] ", s.Title), "", func(v string) {
 		if strings.EqualFold(v, "y") {
 			if err := u.app.Delete(s); err != nil {
-				u.app.Notice = err.Error()
+				u.app.SetNotice(err.Error())
 			}
 		}
 	})
@@ -709,7 +713,7 @@ func (u *UI) newSessionAt(v string) {
 	}
 	abs, err := filepath.Abs(v)
 	if st, serr := os.Stat(abs); err != nil || serr != nil || !st.IsDir() {
-		u.app.Notice = "not a folder: " + v
+		u.app.SetNotice("not a folder: " + v)
 		return
 	}
 	u.newSessionIn(abs)
@@ -718,6 +722,9 @@ func (u *UI) newSessionAt(v string) {
 func (u *UI) newSessionIn(dir string) {
 	create := func(wt bool) {
 		s := u.app.NewSession(dir, wt)
+		if s == nil {
+			return // the daemon is gone; the loop sees Closed and exits
+		}
 		u.open(s)
 		u.pane, u.focus, u.showArchived = paneSession, focusInput, false
 		u.ed.startInsert(len(u.ed.text))
@@ -732,7 +739,7 @@ func (u *UI) newSessionIn(dir string) {
 func (u *UI) rewind(s *core.Session, n int) {
 	u.must(u.app.PreviewRewind(s, n, func(r core.RewindPreview) {
 		if !r.CanRewind {
-			u.app.Notice = "cannot rewind: " + r.Error
+			u.app.SetNotice("cannot rewind: " + r.Error)
 			return
 		}
 		u.ask(fmt.Sprintf("Restore %d file(s) (+%d −%d)? [y/N] ", r.Files, r.Insertions, r.Deletions), "", func(v string) {
@@ -745,7 +752,7 @@ func (u *UI) rewind(s *core.Session, n int) {
 
 func (u *UI) must(err error) {
 	if err != nil {
-		u.app.Notice = err.Error()
+		u.app.SetNotice(err.Error())
 	}
 }
 
@@ -1409,7 +1416,7 @@ func (u *UI) footer(s *core.Session, w int) []line {
 		left = append(left, span{" · ? for shortcuts", dim})
 	}
 	out := []line{ln(left...)}
-	if n := u.app.Notice; n != "" {
+	if n := u.app.Notice(); n != "" {
 		if pad := w - width(left) - ansi.StringWidth(n); pad >= 2 {
 			out[0].spans = append(out[0].spans, span{strings.Repeat(" ", pad), uv.Style{}}, span{n, fg(th.warning)})
 		} else {

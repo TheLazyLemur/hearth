@@ -3,10 +3,12 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	uv "github.com/charmbracelet/ultraviolet"
 
 	"hearth/internal/core"
+	"hearth/internal/testfakes"
 )
 
 func TestSidebarGroupsSessionsUnderProjects(t *testing.T) {
@@ -147,27 +149,15 @@ func TestSessionPickerRanksWordStartMatchesFirst(t *testing.T) {
 	}
 }
 
-type fakeStore struct{ ss []*core.Session }
-
-func (f fakeStore) Load() ([]*core.Session, error) { return f.ss, nil }
-func (fakeStore) Save(*core.Session) error         { return nil }
-func (fakeStore) Delete(string) error              { return nil }
-
-type fakeTranscripts map[string][]core.Entry
-
-func (f fakeTranscripts) Load(_, id string) ([]core.Entry, error) { return f[id], nil }
-
 func TestGrepHitOpensTheSessionWithTheCursorOnTheMatch(t *testing.T) {
 	// given
 	// ... a session whose tool output and reply both mention glamour, deep enough to need scrolling
 	s := &core.Session{SessionID: "local_1", CLISessionID: "c1", Title: "render", OriginCwd: "/p"}
 	es := []core.Entry{{Kind: "user", Text: "add markdown", UUID: "u1"}, {Kind: "tool", Text: "Bash(grep glamour)", ID: "t1"},
 		{Kind: "result", Text: "glamour v2", ID: "t1"}, {Kind: "assistant", Text: strings.Repeat("filler\n\n", 5) + "Rendered with **glamour** now."}}
-	app, err := core.NewApp(fakeStore{[]*core.Session{s}},
-		map[string]core.Backend{core.DefaultBackend: {Label: "Claude Code", Transcripts: fakeTranscripts{"c1": es}}}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	h.Transcripts["c1"] = es
+	app := h.Dial(t)
 	u := &UI{app: app, collapsed: map[string]bool{}}
 
 	// when
