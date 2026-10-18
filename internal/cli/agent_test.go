@@ -37,7 +37,7 @@ func decodeLine(t *testing.T, p *process, line string) core.Event {
 
 func TestLoadTranscriptBuildsEntriesFromCLIJSONL(t *testing.T) {
 	// given
-	// ... a CLI transcript with a user turn, a tool call, its result, a sidechain line and a reply
+	// ... a CLI transcript with a user turn, a tool call, its result, a sidechain line, a reply and an agent's report
 	path := filepath.Join(t.TempDir(), "s.jsonl")
 	jsonl := `{"type":"queue-operation"}
 {"type":"user","uuid":"u1","isSidechain":false,"message":{"role":"user","content":"hello"}}
@@ -45,6 +45,7 @@ func TestLoadTranscriptBuildsEntriesFromCLIJSONL(t *testing.T) {
 {"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","content":"a\nb"}]}}
 {"type":"assistant","uuid":"x","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent"}]}}
 {"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"done"}]}}
+{"type":"user","uuid":"u3","message":{"role":"user","content":"<agent-report session=\"local_c1\" title=\"Find callers\" status=\"completed\">\n3 callers\n</agent-report>"}}
 `
 	if err := os.WriteFile(path, []byte(jsonl), 0o600); err != nil {
 		t.Fatal(err)
@@ -55,8 +56,9 @@ func TestLoadTranscriptBuildsEntriesFromCLIJSONL(t *testing.T) {
 	es, err := loadTranscript(path)
 
 	// then
-	// ... entries follow the conversation, the user turn keeps its rewind UUID, sidechain is skipped
-	want := []core.Entry{{Kind: "user", Text: "hello", UUID: "u1"}, {Kind: "tool", Text: "Bash(ls)"}, {Kind: "result", Text: "a\nb"}, {Kind: "assistant", Text: "done"}}
+	// ... entries follow the conversation, the user turn keeps its rewind UUID, sidechain is skipped, the report is the agent's line
+	want := []core.Entry{{Kind: "user", Text: "hello", UUID: "u1"}, {Kind: "tool", Text: "Bash(ls)"}, {Kind: "result", Text: "a\nb"}, {Kind: "assistant", Text: "done"},
+		{Kind: "info", Text: `↳ agent "Find callers" completed`, ID: "local_c1"}}
 	if err != nil || !reflect.DeepEqual(es, want) {
 		t.Fatalf("err %v entries %+v", err, es)
 	}

@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -415,5 +416,90 @@ func TestStartAgentRefusesWhatItCannotHonour(t *testing.T) {
 				t.Fatalf("reply %q %v sessions %d", reply, isErr, len(a.sessions))
 			}
 		})
+	}
+}
+
+func TestAgentsLeaveTheSidebarAndListUnderTheSessionTheUserStarted(t *testing.T) {
+	// given
+	// ... a session the user started, its agent, that agent's own agent, and an agent whose parent was deleted
+	root := &Session{SessionID: "local_root", Cwd: "/repo", CreatedAt: 1}
+	c1 := &Session{SessionID: "local_c1", Cwd: "/repo", CreatedAt: 2, SpawnedFrom: &SpawnedFrom{SessionID: "local_root", Kind: "agent"}}
+	c2 := &Session{SessionID: "local_c2", Cwd: "/repo", CreatedAt: 3, SpawnedFrom: &SpawnedFrom{SessionID: "local_c1", Kind: "agent"}}
+	orphan := &Session{SessionID: "local_orphan", Cwd: "/repo", CreatedAt: 4, SpawnedFrom: &SpawnedFrom{SessionID: "local_gone", Kind: "agent"}}
+	a, _ := testApp(t, c2, orphan, root, c1)
+
+	// when
+	// ... the sidebar's sessions, the nested agent's root and the root's agents are asked for
+	visible, top, agents := a.Visible(false), a.Root(c2), a.Agents()["local_root"]
+
+	// then
+	// ... the sidebar keeps the root and the orphan, and both agents list under the root, oldest first
+	ids := func(ss []*Session) (out []string) {
+		for _, s := range ss {
+			out = append(out, s.SessionID)
+		}
+		return out
+	}
+	if !slices.Equal(ids(visible), []string{"local_orphan", "local_root"}) || top != root || !slices.Equal(ids(agents), []string{"local_c1", "local_c2"}) {
+		t.Fatalf("visible %v root %s agents %v", ids(visible), top.SessionID, ids(agents))
+	}
+}
+
+func TestAgentKeepsHowItsLastTurnEnded(t *testing.T) {
+	cases := []struct {
+		name      string
+		work      []Event
+		end       TurnEnded
+		report    string
+		retryable bool
+	}{
+		{"finished", []Event{AssistantMessage{Entries: []Entry{{Kind: "assistant", Text: "Done."}}}}, TurnEnded{OK: true}, "completed", false},
+		{"overloaded after doing work", []Event{AssistantMessage{Entries: []Entry{{Kind: "assistant", Text: "Halfway."}}}},
+			TurnEnded{Failure: `error_during_execution ["API Error: 529 Overloaded"]`}, "failed", true},
+		{"overloaded before doing anything", nil, TurnEnded{Failure: `error_during_execution ["API Error: 529 Overloaded"]`}, "failed", false},
+		{"out of turns", []Event{AssistantMessage{Entries: []Entry{{Kind: "assistant", Text: "Halfway."}}}},
+			TurnEnded{Failure: `error_max_turns []`}, "failed", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a session whose agent did this case's work
+			a, _ := testApp(t)
+			parent := a.NewSession("/repo", false)
+			withAgent(a, parent)
+			startAgent(a, parent, map[string]any{"title": "Find callers", "prompt": "List callers."})
+			child := a.sessions[0]
+			for _, e := range c.work {
+				a.Handle(AgentEvent{child.SessionID, e})
+			}
+
+			// when
+			// ... the agent's turn ends
+			a.Handle(AgentEvent{child.SessionID, c.end})
+
+			// then
+			// ... the agent keeps how it ended, and the parent shows a line that names the agent
+			l, shown := a.L(child.SessionID), a.L(parent.SessionID).Queued
+			if l.Report != c.report || l.Retryable != c.retryable || len(shown) != 1 || shown[0].ID != child.SessionID {
+				t.Fatalf("report %q retryable %v shown %+v", l.Report, l.Retryable, shown)
+			}
+		})
+	}
+}
+
+func TestReloadedReportReadsAsTheAgentLine(t *testing.T) {
+	// given
+	// ... a report as hearth sends it to a parent, its title quoted
+	text := "<agent-report session=\"local_c1\" title=\"Find \\\"Send\\\" callers\" status=\"failed\">\nboom\n</agent-report>\nThis report comes from an agent you started, not from the user."
+
+	// when
+	// ... a reloaded transcript reads it, and a message the user typed
+	e, ok := ReportEntry(text)
+	_, typed := ReportEntry("<b>not a report</b>")
+
+	// then
+	// ... the report becomes the parent's agent line, and the typed message isn't one
+	if !ok || typed || e.Kind != "info" || e.ID != "local_c1" || e.Text != `↳ agent "Find \"Send\" callers" failed` {
+		t.Fatalf("entry %+v ok %v typed %v", e, ok, typed)
 	}
 }

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -155,9 +157,13 @@ Your task:
 %s`, parent.Title, prompt)
 }
 
+// temporaryFailure matches turn failures worth retrying as they are: rate limits, overload, server errors, timeouts.
+// shortcut: reads the failure text; have each adapter flag these once both backends' real failures are catalogued.
+var temporaryFailure = regexp.MustCompile(`(?i)\b(429|5\d\d)\b|rate.?limit|overloaded|timed? ?out|connection reset`)
+
 // report relays the end of agent s's turn to the session that started it.
 func (a *App) report(s *Session, l *Live, status, text string) {
-	l.owesParent = false
+	l.owesParent, l.Report, l.Retryable = false, status, false
 	parent := a.Find(s.SpawnedFrom.SessionID)
 	if parent == nil {
 		return // deleted while its agent worked
@@ -167,10 +173,32 @@ func (a *App) report(s *Session, l *Live, status, text string) {
 	}
 	msg := fmt.Sprintf("<agent-report session=%q title=%q status=%q>\n%s\n</agent-report>\nThis report comes from an agent you started, not from the user.",
 		s.SessionID, s.Title, status, truncate(text, maxReport))
-	if err := a.send(parent, msg, Entry{Kind: "info", Text: fmt.Sprintf("↳ agent %q %s", s.Title, status)}); err != nil {
+	if err := a.send(parent, msg, agentLine(s.SessionID, s.Title, status)); err != nil {
 		a.Notice = fmt.Sprintf("agent %q's report was not delivered: %v", s.Title, err)
 	}
 }
+
+// agentLine is how a report shows in its parent's transcript: a line naming the agent, which carries its session.
+func agentLine(id, title, status string) Entry {
+	return Entry{Kind: "info", ID: id, Text: fmt.Sprintf("↳ agent %q %s", title, status)}
+}
+
+var reportHeader = regexp.MustCompile(`^<agent-report session="([^"]*)" title="((?:[^"\\]|\\.)*)" status="([^"]*)">`)
+
+// ReportEntry is the agent line a reloaded transcript shows for text, when text is an agent's report.
+func ReportEntry(text string) (Entry, bool) {
+	m := reportHeader.FindStringSubmatch(text)
+	if m == nil {
+		return Entry{}, false
+	}
+	title, err := strconv.Unquote(`"` + m[2] + `"`)
+	if err != nil {
+		title = m[2]
+	}
+	return agentLine(m[1], title, m[3]), true
+}
+
+const noFinalMessage = "(the agent ended its turn without a final message)"
 
 // finalMessage is the last assistant text of l's current turn.
 func finalMessage(l *Live) string {
@@ -179,7 +207,33 @@ func finalMessage(l *Live) string {
 			return l.Entries[i].Text
 		}
 	}
-	return "(the agent ended its turn without a final message)"
+	return noFinalMessage
+}
+
+// Root is the session the user started that s works under: s itself unless s is an agent.
+func (a *App) Root(s *Session) *Session {
+	for s.SpawnedFrom != nil && s.SpawnedFrom.Kind == "agent" {
+		p := a.Find(s.SpawnedFrom.SessionID)
+		if p == nil {
+			return s // its parent was deleted: it stands alone
+		}
+		s = p
+	}
+	return s
+}
+
+// Agents lists the agents under each root at any depth, oldest first, by the root's session ID.
+func (a *App) Agents() map[string][]*Session {
+	out := map[string][]*Session{}
+	for _, s := range a.sessions {
+		if root := a.Root(s); root != s {
+			out[root.SessionID] = append(out[root.SessionID], s)
+		}
+	}
+	for _, ss := range out {
+		slices.SortStableFunc(ss, func(x, y *Session) int { return cmp.Compare(x.CreatedAt, y.CreatedAt) })
+	}
+	return out
 }
 
 // agentDepth counts the start_agent links above s.
