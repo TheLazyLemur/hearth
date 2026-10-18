@@ -58,9 +58,14 @@ func entries(msg map[string]any) []core.Entry {
 			msg = map[string]any{"content": []any{map[string]any{"type": "text", "text": s}}}
 		}
 		for _, b := range blocks(msg) {
-			// an agent's report is hearth's message to the agent, not the user's
-			if t := str(b["text"]); b["type"] == "text" && !strings.HasPrefix(t, "<agent-report ") {
-				out = append(out, core.Entry{Kind: "user", Text: t})
+			if b["type"] != "text" {
+				continue
+			}
+			// an agent's report is hearth's message to the agent, not the user's: it shows as the agent's line
+			if e, ok := core.ReportEntry(str(b["text"])); ok {
+				out = append(out, e)
+			} else {
+				out = append(out, core.Entry{Kind: "user", Text: str(b["text"])})
 			}
 		}
 	case "assistant":

@@ -46,7 +46,7 @@ func newProcess() (*process, *bufCloser) {
 
 func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 	// given
-	// ... a pi session file with a user turn, a tool call, its result and a reply, under its cwd folder
+	// ... a pi session file with a user turn, a tool call, its result, a reply and an agent's report, under its cwd folder
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "--private-tmp-x--"), 0o700); err != nil {
 		t.Fatal(err)
@@ -58,6 +58,7 @@ func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 {"type":"message","id":"e3","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}}],"stopReason":"toolUse"}}
 {"type":"message","id":"e4","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"a\nb"}],"isError":false}}
 {"type":"message","id":"e5","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}
+{"type":"message","id":"e6","message":{"role":"user","content":"<agent-report session=\"local_c1\" title=\"Find callers\" status=\"completed\">\n3 callers\n</agent-report>"}}
 `
 	if err := os.WriteFile(filepath.Join(dir, "--private-tmp-x--", "2026-10-17T19-11-39-085Z_s1.jsonl"), []byte(jsonl), 0o600); err != nil {
 		t.Fatal(err)
@@ -68,9 +69,9 @@ func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 	es, err := Transcripts{Dir: dir}.Load("/tmp/x", "s1")
 
 	// then
-	// ... entries follow the conversation, with the tool call paired to its result
+	// ... entries follow the conversation, with the tool call paired to its result and the report as the agent's line
 	want := []core.Entry{{Kind: "user", Text: "hello"}, {Kind: "tool", Text: "bash(ls)", ID: "c1"},
-		{Kind: "result", Text: "a\nb", ID: "c1"}, {Kind: "assistant", Text: "done"}}
+		{Kind: "result", Text: "a\nb", ID: "c1"}, {Kind: "assistant", Text: "done"}, {Kind: "info", Text: `↳ agent "Find callers" completed`, ID: "local_c1"}}
 	if err != nil || !reflect.DeepEqual(es, want) {
 		t.Fatalf("err %v entries %+v", err, es)
 	}

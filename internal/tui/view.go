@@ -38,6 +38,8 @@ const (
 	viewCollapseAll
 	viewCommand
 	viewGoToFile
+	viewNextTab
+	viewPrevTab
 )
 
 type search struct {
@@ -148,6 +150,9 @@ func (v *transcriptView) handleKey(lines []screenLine, height int, register *[]r
 
 	if pendingKey == 'g' && char == 'f' {
 		return viewGoToFile
+	}
+	if pendingKey == 'g' && (char == 't' || char == 'T') {
+		return map[rune]viewAction{'t': viewNextTab, 'T': viewPrevTab}[char]
 	}
 
 	switch char {

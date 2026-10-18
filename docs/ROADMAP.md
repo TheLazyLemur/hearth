@@ -45,7 +45,8 @@ tools, appended prompt text, injected messages); the CLI has no feature for it.
   tool. The agent shares the parent's checkout and mode, and by default its backend, model and effort;
   the model can pick any listed backend, model and effort instead. Each of its turns
   the user didn't start is relayed as an `<agent-report>` message (completed, failed, stopped) that
-  steers a running parent or wakes an idle one. Depth 3, 20 at once: Claude Code's defaults.
+  steers a running parent or wakes an idle one. Depth 3, 20 at once: Claude Code's defaults. Agents show as
+  vim-style tabs of the session the user started, not in the sidebar (spec: `docs/specs/start-agent.md`).
 - `start_session`: `initiation` `user_asked` first; `context` fresh (prompt plus background) or fork;
   `use_worktree`, `model`, `effort`, `permission_mode`, `name`, `wake_when_done`.
 - `send_message`: delivered to the target as a queued user turn, wrapped with the sender's id and name.

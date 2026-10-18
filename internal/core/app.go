@@ -33,7 +33,9 @@ type Live struct {
 	errored      bool
 	pending      map[string]func(Reply)
 	wantWorktree bool
-	owesParent   bool // an agent whose current turn its parent awaits a report on
+	owesParent   bool   // an agent whose current turn its parent awaits a report on
+	Report       string // how an agent's last reported turn ended: completed, failed or stopped
+	Retryable    bool   // that turn failed for a temporary reason after doing some work
 }
 
 type App struct {
@@ -160,11 +162,11 @@ func (a *App) save(s *Session) {
 
 func (a *App) IsRepo(dir string) bool { return a.worktrees.IsRepo(dir) }
 
-// Visible lists sessions for the sidebar: starred first, then most recent.
+// Visible lists sessions for the sidebar, leaving out agents shown under their root: starred first, then most recent.
 func (a *App) Visible(showArchived bool) []*Session {
 	var out []*Session
 	for _, s := range a.sessions {
-		if s.IsArchived == showArchived {
+		if s.IsArchived == showArchived && a.Root(s) == s {
 			out = append(out, s)
 		}
 	}
@@ -601,7 +603,9 @@ func (a *App) Handle(m AgentEvent) {
 			case e.OK:
 				a.report(s, l, "completed", finalMessage(l))
 			default:
+				retry := temporaryFailure.MatchString(e.Failure) && finalMessage(l) != noFinalMessage
 				a.report(s, l, "failed", e.Failure+"\n\n"+finalMessage(l))
+				l.Retryable = retry
 			}
 		}
 		if s.TitleSource == "auto" && s.CompletedTurns == 1 {

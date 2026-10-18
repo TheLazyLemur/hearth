@@ -125,11 +125,15 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
-	launched     string      // default folder for new sessions
-	pick         *picker     // the open session or grep picker
-	ambient      color.Color // background for draws that set none: the sidebar or picker card being painted
-	lead         bool        // the last key was a lone space: the start of a picker chord
-	jump         int         // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	launched     string                     // default folder for new sessions
+	pick         *picker                    // the open session or grep picker
+	ambient      color.Color                // background for draws that set none: the sidebar or picker card being painted
+	lead         bool                       // the last key was a lone space: the start of a picker chord
+	jump         int                        // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	tabs         map[string][]*tab          // agent tabs by the session the user started
+	agents       map[string][]*core.Session // every root's agents, as of the last syncTabs
+	count        int                        // tab number typed before gt
+	now          func() time.Time
 }
 
 // Run drives app from the terminal until the user quits. launched is the
@@ -144,7 +148,7 @@ func Run(app *core.App, launched string) error {
 	}
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
-	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
+	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched, tabs: map[string][]*tab{}, now: time.Now}
 	if vs := app.Visible(false); len(vs) > 0 {
 		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
 	}
@@ -162,7 +166,7 @@ func Run(app *core.App, launched string) error {
 		case m := <-app.Events():
 			app.Handle(m)
 		case <-tick.C:
-			if !app.AnyRunning() {
+			if !app.AnyRunning() && !u.closing() {
 				continue
 			}
 		}
@@ -362,6 +366,25 @@ func (u *UI) sidebarKey(seq string) {
 func (u *UI) inputKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	normal := u.ed.mode == modeNormal
+	if normal && u.ed.pendingOp == 0 { // the editor leaves g and counts free: gt, gT and {n}gt switch tabs
+		switch {
+		case u.op == "g":
+			count := u.count
+			u.op, u.count = "", 0
+			if char == 'T' {
+				u.switchTab(s, false, 0)
+			} else if char == 't' {
+				u.switchTab(s, true, count)
+			}
+			return
+		case char == 'g':
+			u.op = "g"
+			return
+		case u.tabKey(char):
+			return
+		}
+		u.count = 0
+	}
 	switch {
 	case k.MatchString("ctrl+s"):
 		u.submit(s, true)
@@ -406,6 +429,9 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 		}
 	}()
 	if !tv.search.typing && tv.visual == visualOff && tv.pendingKey == 0 && !tv.pendingWindowCmd {
+		if u.tabKey(char) {
+			return
+		}
 		op := u.op
 		u.op = ""
 		switch {
@@ -438,6 +464,10 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 			return
 		}
 	}
+	count := u.count
+	if char != 'g' || tv.pendingKey != 0 {
+		u.count = 0
+	}
 	act := tv.handleKey(u.slines, u.view, &u.register, char, key)
 	if tv.note != "" {
 		u.app.Notice, tv.note = tv.note, ""
@@ -455,6 +485,16 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 		u.ask(":", "", u.command)
 	case viewQuit:
 		u.app.Notice = "type :q to quit"
+	case viewNextTab:
+		u.switchTab(s, true, count)
+	case viewPrevTab:
+		u.switchTab(s, false, 0)
+	case viewGoToFile:
+		if ag := u.agentLineAt(s); ag != nil {
+			u.openTab(ag)
+		} else {
+			u.app.Notice = "gf: no agent on this line"
+		}
 	}
 }
 
@@ -487,6 +527,11 @@ func (u *UI) submit(s *core.Session, interrupt bool) {
 	}
 	u.ed.reset()
 	u.tv.held = false
+	if root := u.app.Root(s); root != s { // typed into an agent: its tab stays until closed
+		if i := tabIndex(u.tabs[root.SessionID], s.SessionID); i >= 0 {
+			u.tabs[root.SessionID][i].pinned = true
+		}
+	}
 }
 
 // pickModel offers s's backend models; typing filters them, a number or enter picks, unlisted text is taken as an id.
@@ -615,7 +660,14 @@ func (u *UI) command(line string) {
 	switch name {
 	case "":
 		return
-	case "q", "q!", "qa", "qa!", "quit", "wq", "x":
+	case "q", "q!":
+		if s != nil && u.app.Root(s) != s { // on an agent's tab, :q closes the tab
+			u.closeTab(s)
+			return
+		}
+		u.quit = true
+		return
+	case "qa", "qa!", "quit", "wq", "x":
 		u.quit = true
 		return
 	case "e", "edit", "new":
@@ -686,6 +738,8 @@ func (u *UI) command(line string) {
 		}
 	case "dismiss":
 		u.app.DismissChip(s, n-1)
+	case "tabclose", "tabc":
+		u.closeTab(s)
 	case "unqueue":
 		u.unqueue(s)
 	case "star":
@@ -1004,6 +1058,7 @@ func (u *UI) draw() {
 		scr.Flush()
 		return
 	}
+	u.syncTabs()
 	sw := min(36, W/3)
 	u.drawSidebar(sw, H)
 	x, w := sw+3, W-sw-5
@@ -1036,9 +1091,14 @@ func (u *UI) draw() {
 		}
 		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(logo)+1, w, msg, fg(th.inactive))
 	} else {
+		y0 := 0 // the tab line, when there is one, sits above the transcript
+		if tl := u.tabLine(s); tl != nil {
+			u.drawLine(x, 0, w, *tl)
+			y0 = 1
+		}
 		lines := u.transcript(s, l, w)
 		old := u.slines
-		u.slines, u.view = screenLines(lines), max(1, top-1)
+		u.slines, u.view = screenLines(lines), max(1, top-1-y0)
 		if raw := u.rawMarkdown(); raw != u.raw { // replies reflowed: keep the cursor on what it was on
 			u.raw = raw
 			was := u.tv.cursor.line
@@ -1059,10 +1119,10 @@ func (u *UI) draw() {
 		}
 		start := u.tv.scrollTop
 		for i := 0; i < u.view && start+i < len(lines); i++ {
-			u.drawLine(x, i, w, lines[start+i])
+			u.drawLine(x, y0+i, w, lines[start+i])
 		}
 		if viewing {
-			u.drawViewMarks(x, start, cy < 0)
+			u.drawViewMarks(x, y0, start, cy < 0)
 		}
 	}
 	if u.pick != nil {
@@ -1077,7 +1137,7 @@ func (u *UI) draw() {
 
 // drawViewMarks reverses the visual selection and search matches, and puts the
 // terminal cursor on the transcript cursor.
-func (u *UI) drawViewMarks(x, start int, showCursor bool) {
+func (u *UI) drawViewMarks(x, y0, start int, showCursor bool) {
 	vs, ve := u.tv.selection()
 	pat := u.tv.search.pattern
 	for i := 0; i < u.view && start+i < len(u.slines); i++ {
@@ -1096,7 +1156,7 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 			}
 		}
 		markMatches(hit, cells, pat)
-		u.reverseCells(x, i, cells, hit)
+		u.reverseCells(x, y0+i, cells, hit)
 	}
 	if c := u.tv.cursor; showCursor && c.line >= start && c.line < start+u.view && c.line < len(u.slines) {
 		cells := u.slines[c.line].cells
@@ -1104,7 +1164,7 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 		for _, ce := range cells[:min(c.col, len(cells))] {
 			cx += ansi.StringWidth(string(ce.char))
 		}
-		u.scr.SetCursorPosition(cx, c.line-start)
+		u.scr.SetCursorPosition(cx, y0+c.line-start)
 		u.scr.ShowCursor()
 	}
 }
@@ -1181,6 +1241,13 @@ func (u *UI) drawSidebar(w, h int) {
 			continue
 		}
 		glyph, gst := u.statusGlyph(r.s)
+		agents := ""
+		if n, waiting := u.agentsOf(r.s); n > 0 {
+			agents = fmt.Sprintf("  %d agent%s", n, map[bool]string{true: "s"}[n > 1])
+			if waiting && u.app.Status(r.s) != "waiting" { // an agent needs the user: the row says so
+				glyph, gst = "?", fg(th.accent)
+			}
+		}
 		star := "  "
 		if r.s.IsStarred {
 			star = "★ "
@@ -1196,7 +1263,7 @@ func (u *UI) drawSidebar(w, h int) {
 			}
 			tag = u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
 		}
-		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.subtle)}, span{t, st}, span{branch, fg(th.subtle)}))
+		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.subtle)}, span{t, st}, span{agents, fg(th.subtle)}, span{branch, fg(th.subtle)}))
 	}
 }
 
@@ -1446,7 +1513,8 @@ func (u *UI) footer(s *core.Session, w int) []line {
 			help = "INSERT  enter send/queue · ctrl+s interrupt+send · ctrl+j newline · esc → NORMAL\n" +
 				"NORMAL  h j k l w b e 0 ^ $ · d c y + motion, dd cc yy · x X r D C · o O p P u · enter send · i a I A · k on top line → VIEW · esc interrupt\n" +
 				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
-				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt\n" +
+				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt · gf open agent\n" +
+				"TABS    gt gT {n}gt switch · :tabclose or :q close an agent's tab\n" +
 				"        space space sessions · space / grep · ctrl+h list · :backend :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
 		}
 		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
