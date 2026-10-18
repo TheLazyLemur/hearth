@@ -11,11 +11,11 @@ import (
 // th is hearth's palette, sumi: ink greys, washi text, one shu (vermilion) accent.
 var th = struct {
 	accent, text, inactive, subtle, success, error, warning, userBg color.Color
-	panel, card                                                     color.Color // sidebar and floating-card tints
+	card                                                            color.Color // floating-card tint
 }{
 	accent: rgb(206, 78, 54), text: rgb(228, 222, 210), inactive: rgb(122, 118, 111), subtle: rgb(58, 56, 53),
 	success: rgb(128, 146, 108), error: rgb(196, 92, 80), warning: rgb(178, 150, 106),
-	userBg: rgb(38, 37, 35), panel: rgb(24, 23, 22), card: rgb(30, 29, 27),
+	userBg: rgb(38, 37, 35), card: rgb(30, 29, 27),
 }
 
 func rgb(r, g, b uint8) color.Color { return color.RGBA{r, g, b, 255} }

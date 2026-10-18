@@ -127,7 +127,7 @@ type UI struct {
 	quit         bool
 	launched     string      // default folder for new sessions
 	pick         *picker     // the open session or grep picker
-	ambient      color.Color // background for draws that set none: the sidebar or card being painted
+	ambient      color.Color // background for draws that set none: the picker card being painted
 	lead         bool        // the last key was a lone space: the start of a picker chord
 	jump         int         // entry+1 to put the transcript cursor on at the next draw (grep hits)
 }
@@ -1135,11 +1135,6 @@ func screenLines(lines []line) []screenLine {
 }
 
 func (u *UI) drawSidebar(w, h int) {
-	u.ambient = th.panel
-	defer func() { u.ambient = nil }()
-	for y := 0; y < h; y++ {
-		u.put(0, y, w+1, strings.Repeat(" ", w+1), uv.Style{})
-	}
 	title := "projects"
 	if u.showArchived {
 		title = "archived"
