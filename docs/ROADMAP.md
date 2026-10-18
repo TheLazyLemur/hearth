@@ -1,136 +1,56 @@
 # Roadmap
 
 hearth is a harness on top of coding agents, not a control panel over their terminals. It drives
-each agent through a structured protocol, owns sessions, worktrees, permissions, tools and
-orchestration itself, and treats a backend as little more than a model loop.
+each agent through a structured protocol and owns sessions, worktrees, permissions, tools and
+orchestration itself; a backend is little more than a model loop.
 
-Order: **daemon → nested sessions → more backends**. Everything new lives in `core.App` as plain
-data, never in `tui`, so it reaches instances through the daemon's socket unchanged.
+Everything new lives in `core.App` as plain data, never in `tui`, so it reaches every client through
+the daemon unchanged.
 
-## 1. Daemon (built)
+## Done
 
-`App`, the agent adapters and later our own tools run in a background process that owns the agent
-processes and the store, listening on a Unix socket. The TUI is a client: snapshot, then a stream of
-changes. One binary: `hearth daemon`; plain `hearth` starts it if needed, then connects. The spec is
-`docs/specs/daemon.md`.
+- **Daemon.** One background process owns the app; every `hearth` is a client of it over a Unix
+  socket. Spec: `docs/specs/daemon.md`.
+- **`start_agent`.** Subagents as hearth sessions on any backend, shown as tabs of the session that
+  started them. Spec: `docs/specs/start-agent.md`.
 
-Requirements:
+## Next
 
-- Running turns and, later, nested children and parent wakes survive `:q` and the laptop lid.
-- Every open hearth instance sees the same live state.
-- SSH via the same protocol over a forwarded socket.
-- Opening hearth in any terminal stays the natural way in. Sessions are shared; view state is per
-  client: focus, selection, collapsed groups, scroll, visual mode, and the launch folder. A client
-  launched in a folder focuses that project's group and selects its latest session; if the project
-  has no sessions, it shows the group with "new session here" instead of an empty list.
+### 1. Daemon follow-ups
 
-Still open after the first slice: SSH over a forwarded socket, notifications while nobody is
-attached, reconnecting a client, and per-session subscriptions.
+- Reconnect a client without a full snapshot.
+- Per-session subscriptions, so a client loads only the transcripts it shows.
+- Notifications while nobody is attached. Reverses the daemon's "permissions wait, no
+  notifications" decision.
+- SSH over a forwarded socket.
 
-Decisions made:
+### 2. Nested sessions
 
-1. Lifecycle: exit when no client is attached and nothing runs — no turn, permission or queued
-   message — after about 30 seconds.
-2. Nobody attached: permission requests wait for the next client. No notifications.
-3. Several clients answer the same permission: the first answer wins, later ones get "already
-   answered", and every instance's dialog closes.
-4. Upgrades: a new binary replaces an idle daemon of another protocol version and refuses a busy one
-   with "daemon vX is running turns; finish or `hearth daemon stop`".
-5. State format: split into plain data and live handles. `Live` carries what clients hold; the agent
-   handle and reply callbacks stay in the daemon.
+A session starts other sessions, they report back, and the parent wakes when they finish:
+`start_session`, `send_message`, `list_sessions`, `get_session`, and children nested under their
+parent in the sidebar. Needs research first; draft notes in `docs/specs/nested-sessions.md`.
 
-## 2. Nested sessions
+### 3. Web client
 
-Parity with Claude Desktop's nested ("side") sessions: a session starts other sessions, they report
-back, and the parent is woken when they finish. Desktop does this entirely host-side (in-process MCP
-tools, appended prompt text, injected messages); the CLI has no feature for it.
+A responsive PWA, served by a bridge in the hearth binary that relays the daemon's protocol over
+WebSocket, reached over Tailscale.
 
-### Core (`core.App`)
+- Bridge as a tailnet node (`tsnet`): TLS from MagicDNS, each connection checked against your
+  Tailscale login with `WhoIs`.
+- Web assets embedded in the binary, so client and daemon always speak the same protocol version.
+- Web Push for finished turns and permission requests; payloads carry a title and state, never
+  transcript text.
+- Needs reconnect and per-session subscriptions from §1: a phone reconnects every time it's opened.
 
-- Widen `SpawnedFrom`: `Name` (short handle), `Kind` (`side` | `fork` | `btw` | `task`), `Detached`.
-- `App.Spawn(parent, spec)`: fresh or fork, own worktree or shared checkout, inheriting the parent's
-  backend, model, effort and permission mode (never higher). `AcceptChip` becomes `Spawn` with
-  Kind `task`.
-- Reminder queue per session: pending text sent as `<system-reminder>` ahead of the next user
-  message. The transcript view hides these blocks, live and from JSONL.
-- Turn-end router in `Handle`: a child's result becomes a note to its parent per its Kind:
-  title, how it ended (finished, error, stopped, lost), branch and PR, first 400 characters of its
-  report. Notes queue on the parent (cap 32).
-- Roster reminder ("Linked sessions now"): every family member's name, id and state (working, idle,
-  failed, needs the user, done with PR), refreshed for the whole family on change.
-- Wake: once no child is working and the parent is idle (no turn, no pending permission or
-  question), send the parent a `<side-sessions-event>` turn. Capped per user message from day one.
-- Persist lineage, queued notes and wake state, so a restart doesn't drop what a parent is owed.
+### 4. Backends
 
-### Kind policies
+Goal: built-in tools off, hearth's tools in their place; a backend is a model loop plus our tools
+behind our gate.
 
-| Kind | Started by | On child turn end | Wakes parent | Roster |
-|---|---|---|---|---|
-| `side` | the model (`start_session`) | note | yes | yes |
-| `fork` | the user, or `hand_off` | note | no, waits for the parent's next turn | yes |
-| `btw` | the user (side chat) | nothing | no | hidden; archived on close once settled |
-| `task` | the user accepts a chip | nothing | no | yes |
-
-### Tools (`core.Tools`, so every backend gets them)
-
-- `start_agent` (shipped): Claude Code-style subagents on this core, replacing Claude's built-in Agent
-  tool. The agent shares the parent's checkout and mode, and by default its backend, model and effort;
-  the model can pick any listed backend, model and effort instead. Each of its turns
-  the user didn't start is relayed as an `<agent-report>` message (completed, failed, stopped) that
-  steers a running parent or wakes an idle one. Depth 3, 20 at once: Claude Code's defaults. Agents show as
-  vim-style tabs of the session the user started, not in the sidebar (spec: `docs/specs/start-agent.md`).
-- `start_session`: `initiation` `user_asked` first; `context` fresh (prompt plus background) or fork;
-  `use_worktree`, `model`, `effort`, `permission_mode`, `name`, `wake_when_done`.
-- `send_message`: delivered to the target as a queued user turn, wrapped with the sender's id and name.
-- `list_sessions {linked}`, `get_session`.
-- Guidance lives in tool descriptions and in a header `Spawn` puts on the child's brief (who started
-  it, that its last message is relayed, message the parent only when blocked). Our own wording, not
-  Desktop's.
-
-### TUI
-
-- Children nested under their parent in the sidebar, with state.
-
-### Later variants on the same core
-
-- `btw` side chats, user fork, `hand_off_to_session`.
-- `offer` cards ("New session" / "Do it here", blocking the tool call) and `own_initiative` proposal
-  cards that expire after a week.
-- `detach_session`, `stop_session`, `archive_session`.
-- Placement (`cwd`, SSH host, presets, cloud) only once hearth has those features underneath.
-
-## 3. Harness seams
-
-- System-prompt hook, built by core per session and delivered by each adapter: Claude
-  `--append-system-prompt` on every launch including resume; pi through `host.mjs`
-  `before_agent_start`. Deferred: tool descriptions carry the guidance until they prove too weak.
-  Keep the system prompt static; anything that changes goes through the reminder queue.
-- `Fork` capability on `Backend`, beside `Rewind` and `Unqueue`. Claude: `--resume --fork-session`
-  (unverified over stream-json). pi: unknown.
-- Tool calls already know their caller: `CallTool` returns an event and `Handle` routes it by
-  `AgentEvent.SessionID`. New tools follow the `TaskSuggested` pattern.
-
-## 4. Backends
-
-Contract every backend must meet:
-
-- start, resume, interrupt; messages sent mid-turn are queued;
-- structured events: turn start and end, assistant text, tool calls and results, errors;
-- serves `core.Tools`, and gates every tool that isn't ours through hearth's permission flow;
-- accepts appended system-prompt text (see §3).
-
-Optional, advertised as capabilities: fork, rewind, unqueue, native permission modes, model and
-effort listing. Keep these as bools until a third backend shows the right shape.
-
-End state: built-in tools off, hearth's own tools in their place; a backend is a model loop plus
-our tools behind our gate. Children default to the parent's backend; a `backend` argument on
-`start_session` would let one agent start another kind.
-
-## 5. Tracking Claude Desktop
-
-Desktop's app bundle is readable JavaScript (`npx @electron/asar extract app.asar`). Following a day
-or two behind is the plan. Possible automation: extract each release and diff its tool definitions,
-prompt text and control-protocol subtypes against the last one.
+Every backend must start, resume, interrupt and queue mid-turn messages; emit structured events;
+serve `core.Tools` and route every other tool through hearth's permissions; and accept appended
+system-prompt text. Fork, rewind, unqueue, permission modes and model listing are optional
+capabilities, kept as bools until a third backend shows the right shape.
 
 ## Deferred until it hurts
 

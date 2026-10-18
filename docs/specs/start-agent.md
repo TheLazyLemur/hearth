@@ -141,7 +141,7 @@ Agents open as vim-style tabs of the session the user started. The tab line sits
 
 - **Core leaves agents out of the session list.** `Visible` skips agents whose root still exists, so the sidebar, the session picker and grep all leave them out. An agent whose parent was deleted stands alone in the sidebar. Core gives each agent's root (`Root`), the first session above it that isn't an agent, and the agents below each root (`Agents`).
 - **Core keeps how each agent's last turn ended.** `report` already knows `completed`, `failed` or `stopped`. It also records the status on the agent's `Live`, so the TUI can tell a finished agent from a failed one without parsing the parent's transcript.
-- **Tabs are view state and live in the TUI.** Per root session, the TUI keeps the ordered open tabs and, per tab, a close time and a pinned flag. Tab 1 is always the root. This matches the roadmap's daemon plan, where view state is per client.
+- **Tabs are view state and live in the TUI.** Per root session, the TUI keeps the ordered open tabs and, per tab, a close time and a pinned flag. Tab 1 is always the root. This matches the daemon, where view state is per client.
 - **A tab opens when the TUI first sees an agent of that root working.** Focus does not move.
 - **Closing rules.** These are checked on the TUI's existing 120 ms tick. The 30 seconds is Claude Code's `jA = 30000`.
   - Report `completed`: the tab closes at once.
