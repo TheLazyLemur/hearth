@@ -211,22 +211,28 @@ func finalMessage(l *Live) string {
 }
 
 // Root is the session the user started that s works under: s itself unless s is an agent.
-func (a *App) Root(s *Session) *Session {
+func (a *App) Root(s *Session) *Session { return Root(a.sessions, s) }
+
+// Root is the session among ss the user started that s works under: s itself unless s is an agent.
+func Root(ss []*Session, s *Session) *Session {
 	for s.SpawnedFrom != nil && s.SpawnedFrom.Kind == "agent" {
-		p := a.Find(s.SpawnedFrom.SessionID)
-		if p == nil {
+		i := slices.IndexFunc(ss, func(p *Session) bool { return p.SessionID == s.SpawnedFrom.SessionID })
+		if i < 0 {
 			return s // its parent was deleted: it stands alone
 		}
-		s = p
+		s = ss[i]
 	}
 	return s
 }
 
 // Agents lists the agents under each root at any depth, oldest first, by the root's session ID.
-func (a *App) Agents() map[string][]*Session {
+func (a *App) Agents() map[string][]*Session { return Agents(a.sessions) }
+
+// Agents lists the agents among ss under each root at any depth, oldest first, by the root's session ID.
+func Agents(ss []*Session) map[string][]*Session {
 	out := map[string][]*Session{}
-	for _, s := range a.sessions {
-		if root := a.Root(s); root != s {
+	for _, s := range ss {
+		if root := Root(ss, s); root != s {
 			out[root.SessionID] = append(out[root.SessionID], s)
 		}
 	}

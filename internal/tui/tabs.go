@@ -124,7 +124,7 @@ func (u *UI) switchTab(s *core.Session, next bool, n int) {
 	i := slices.Index(ids, s.SessionID)
 	switch {
 	case n > len(ids):
-		u.app.Notice = fmt.Sprintf("no tab %d", n)
+		u.app.SetNotice(fmt.Sprintf("no tab %d", n))
 		return
 	case n > 0:
 		i = n - 1
@@ -150,9 +150,9 @@ func (u *UI) closeTab(s *core.Session) {
 	root := u.app.Root(s)
 	switch {
 	case root == s:
-		u.app.Notice = "this is the session's own tab; :q quits"
+		u.app.SetNotice("this is the session's own tab; :q quits")
 	case u.working(s):
-		u.app.Notice = "the agent is working: esc stops it, then :tabclose"
+		u.app.SetNotice("the agent is working: esc stops it, then :tabclose")
 	default:
 		ts := u.tabs[root.SessionID]
 		u.tabs[root.SessionID] = slices.Delete(ts, tabIndex(ts, s.SessionID), tabIndex(ts, s.SessionID)+1)

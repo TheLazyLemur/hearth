@@ -7,20 +7,19 @@ import (
 	uv "github.com/charmbracelet/ultraviolet"
 
 	"hearth/internal/core"
+	"hearth/internal/daemon"
+	"hearth/internal/testfakes"
 )
 
 // tabbed is a UI on a session the user started (local_root) with agents under it; the clock reads *now.
-func tabbed(t *testing.T, now *time.Time, agents ...string) (*UI, *core.App) {
+func tabbed(t *testing.T, now *time.Time, agents ...string) (*UI, *daemon.Client) {
 	t.Helper()
 	ss := []*core.Session{{SessionID: "local_root", Title: "main", OriginCwd: "/p"}}
 	for i, id := range agents {
 		ss = append(ss, &core.Session{SessionID: id, Title: id, OriginCwd: "/p", CreatedAt: int64(i + 1),
 			SpawnedFrom: &core.SpawnedFrom{SessionID: "local_root", Kind: "agent"}})
 	}
-	app, err := core.NewApp(fakeStore{ss}, map[string]core.Backend{core.DefaultBackend: {Label: "Claude Code", Transcripts: fakeTranscripts{}}}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	app := testfakes.NewHarness(t, time.Hour, ss...).Dial(t)
 	u := &UI{app: app, collapsed: map[string]bool{}, tabs: map[string][]*tab{}, now: func() time.Time { return *now }, cur: "local_root", pane: paneSession, view: 5}
 	return u, app
 }

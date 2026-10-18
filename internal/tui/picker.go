@@ -142,7 +142,7 @@ func fuzzy(query, text []rune) (score int, hits []int, ok bool) {
 
 // grepItems finds query, literally and with the transcript search's case rule,
 // in every line of the visible sessions' messages: one item per matching line.
-func grepItems(app *core.App, query []rune) []pickItem {
+func grepItems(app Client, query []rune) []pickItem {
 	if len(query) == 0 {
 		return nil
 	}

@@ -27,11 +27,12 @@ type Live struct {
 	Verb         string    // spinner verb for the current turn
 	Version      string    // CLI version and model, from Initialized
 	Model        string
+	Loaded       bool // the transcript was read into Entries
+	Errored      bool // the last turn failed
 	agent        Agent
-	loaded       bool
 	interrupted  bool // the running turn was interrupted by the user
-	errored      bool
 	pending      map[string]func(Reply)
+	asked        string // id of the request PreviewRewind or Unqueue last put to the agent
 	wantWorktree bool
 	owesParent   bool   // an agent whose current turn its parent awaits a report on
 	Report       string // how an agent's last reported turn ended: completed, failed or stopped
@@ -120,8 +121,12 @@ func (a *App) list(b, cwd string) {
 
 // Efforts lists the effort levels s's model accepts, or nil when its model isn't listed.
 func (a *App) Efforts(s *Session) []string {
-	id := cmp.Or(s.Model, a.L(s.SessionID).Model)
-	for _, m := range a.models[s.Backend] {
+	return Efforts(a.models[s.Backend], cmp.Or(s.Model, a.L(s.SessionID).Model))
+}
+
+// Efforts lists the effort levels model id accepts among models, or nil when it isn't listed.
+func Efforts(models []Model, id string) []string {
+	for _, m := range models {
 		if m.ID == id {
 			return m.Efforts
 		}
@@ -135,6 +140,21 @@ func (a *App) unsupported(s *Session, what string) error {
 
 // Events delivers agent reports; pass each to Handle on the goroutine that calls every other App method.
 func (a *App) Events() <-chan AgentEvent { return a.events }
+
+// Sessions lists every session, newest first, archived ones included.
+func (a *App) Sessions() []*Session { return a.sessions }
+
+// ListedModels is the model lists fetched so far, by backend; nil while a listing runs.
+func (a *App) ListedModels() map[string][]Model { return a.models }
+
+// Caps is what each backend offers: the part of it clients hold instead of the backend.
+func (a *App) Caps() map[string]Caps {
+	caps := make(map[string]Caps, len(a.backends))
+	for name, b := range a.backends {
+		caps[name] = b.Caps()
+	}
+	return caps
+}
 
 func (a *App) L(id string) *Live {
 	l := a.live[id]
@@ -163,10 +183,13 @@ func (a *App) save(s *Session) {
 func (a *App) IsRepo(dir string) bool { return a.worktrees.IsRepo(dir) }
 
 // Visible lists sessions for the sidebar, leaving out agents shown under their root: starred first, then most recent.
-func (a *App) Visible(showArchived bool) []*Session {
+func (a *App) Visible(showArchived bool) []*Session { return Visible(a.sessions, showArchived) }
+
+// Visible lists ss for the sidebar, leaving out agents shown under their root: starred first, then most recent.
+func Visible(ss []*Session, showArchived bool) []*Session {
 	var out []*Session
-	for _, s := range a.sessions {
-		if s.IsArchived == showArchived && a.Root(s) == s {
+	for _, s := range ss {
+		if s.IsArchived == showArchived && Root(ss, s) == s {
 			out = append(out, s)
 		}
 	}
@@ -179,8 +202,10 @@ func (a *App) Visible(showArchived bool) []*Session {
 	return out
 }
 
-func (a *App) Status(s *Session) string {
-	l := a.live[s.SessionID]
+func (a *App) Status(s *Session) string { return a.live[s.SessionID].Status() }
+
+// Status reports what the session is doing, for the sidebar; a nil Live is idle.
+func (l *Live) Status() string {
 	switch {
 	case l == nil:
 		return "idle"
@@ -188,7 +213,7 @@ func (a *App) Status(s *Session) string {
 		return "waiting"
 	case l.Running:
 		return "running"
-	case l.errored:
+	case l.Errored:
 		return "error"
 	}
 	return "idle"
@@ -213,7 +238,7 @@ func (a *App) NewSession(dir string, worktree bool) *Session {
 	s := &Session{SessionID: "local_" + newUUID(), Backend: DefaultBackend, Cwd: dir, OriginCwd: dir, PermissionMode: "default",
 		CreatedAt: t, LastActivityAt: t}
 	a.L(s.SessionID).wantWorktree = worktree
-	a.L(s.SessionID).loaded = true
+	a.L(s.SessionID).Loaded = true
 	a.sessions = append([]*Session{s}, a.sessions...)
 	a.save(s)
 	return s
@@ -231,10 +256,10 @@ func (a *App) ToggleArchive(s *Session) {
 
 func (a *App) EnsureLoaded(s *Session) {
 	l := a.L(s.SessionID)
-	if l.loaded || s.CLISessionID == "" {
+	if l.Loaded || s.CLISessionID == "" {
 		return
 	}
-	l.loaded = true
+	l.Loaded = true
 	es, err := a.Backend(s).Transcripts.Load(s.Cwd, s.CLISessionID)
 	if err != nil {
 		l.Entries = append(l.Entries, Entry{Kind: "error", Text: "transcript unavailable: " + err.Error()})
@@ -243,7 +268,8 @@ func (a *App) EnsureLoaded(s *Session) {
 	l.Entries = es
 }
 
-func (a *App) ensureAgent(s *Session) (Agent, error) {
+// EnsureAgent starts s's agent if none runs, as the first message to it would.
+func (a *App) EnsureAgent(s *Session) (Agent, error) {
 	l := a.L(s.SessionID)
 	if l.agent != nil {
 		return l.agent, nil
@@ -252,7 +278,7 @@ func (a *App) ensureAgent(s *Session) (Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.agent, l.errored = ag, false
+	l.agent, l.Errored = ag, false
 	return ag, nil
 }
 
@@ -274,7 +300,7 @@ func (a *App) send(s *Session, text string, shown Entry) error {
 	if s.Title == "" {
 		s.Title, s.TitleSource = truncate(FirstLines(text, 1), 50), "auto"
 	}
-	ag, err := a.ensureAgent(s)
+	ag, err := a.EnsureAgent(s)
 	if err != nil {
 		return err
 	}
@@ -317,7 +343,8 @@ func (a *App) Unqueue(s *Session, done func(string)) error {
 	if e.Kind != "user" {
 		return fmt.Errorf("the newest queued message is an agent's report, not yours")
 	}
-	l.pending[l.agent.CancelQueued(e.UUID)] = func(r Reply) {
+	l.asked = l.agent.CancelQueued(e.UUID)
+	l.pending[l.asked] = func(r Reply) {
 		if !r.Cancelled {
 			a.Notice = "too late: the agent already read that message"
 			return
@@ -373,7 +400,7 @@ func (a *App) Rename(s *Session, title string) {
 func (a *App) AnswerPerm(s *Session, allow, always bool) error {
 	l := a.L(s.SessionID)
 	if len(l.Perms) == 0 || l.agent == nil {
-		return fmt.Errorf("no pending permission request")
+		return fmt.Errorf("already answered")
 	}
 	p := l.Perms[0]
 	l.Perms = l.Perms[1:]
@@ -494,13 +521,19 @@ func (a *App) PreviewRewind(s *Session, turn int, done func(RewindPreview)) erro
 	if err != nil {
 		return err
 	}
-	ag, err := a.ensureAgent(s)
+	ag, err := a.EnsureAgent(s)
 	if err != nil {
 		return err
 	}
-	a.L(s.SessionID).pending[ag.Rewind(id, true)] = func(r Reply) { done(r.Rewind) }
+	l := a.L(s.SessionID)
+	l.asked = ag.Rewind(id, true)
+	l.pending[l.asked] = func(r Reply) { done(r.Rewind) }
 	return nil
 }
+
+// Asked is the id of the request PreviewRewind or Unqueue last put to s's agent; their
+// callbacks never run if its reply is an error.
+func (a *App) Asked(s *Session) string { return a.L(s.SessionID).asked }
 
 // Rewind restores files to before turn (1-based).
 func (a *App) Rewind(s *Session, turn int) error {
@@ -508,7 +541,7 @@ func (a *App) Rewind(s *Session, turn int) error {
 	if err != nil {
 		return err
 	}
-	ag, err := a.ensureAgent(s)
+	ag, err := a.EnsureAgent(s)
 	if err != nil {
 		return err
 	}
@@ -552,7 +585,7 @@ func (a *App) Handle(m AgentEvent) {
 		}
 		l.Queued = nil
 		if l.Running {
-			l.Running, l.errored = false, true
+			l.Running, l.Errored = false, true
 			l.Entries = append(l.Entries, Entry{Kind: "error", Text: fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err)})
 		}
 		if l.owesParent {
