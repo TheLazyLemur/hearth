@@ -22,7 +22,6 @@ import (
 var (
 	modes   = []string{"default", "acceptEdits", "plan", "auto"}
 	efforts = []string{"", "low", "medium", "high", "xhigh", "max"}
-	th      = themes["dark"]
 )
 
 const (
@@ -126,15 +125,16 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
-	launched     string  // default folder for new sessions
-	pick         *picker // the open session or grep picker
-	lead         bool    // the last key was a lone space: the start of a picker chord
-	jump         int     // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	launched     string      // default folder for new sessions
+	pick         *picker     // the open session or grep picker
+	ambient      color.Color // background for draws that set none: the sidebar or picker card being painted
+	lead         bool        // the last key was a lone space: the start of a picker chord
+	jump         int         // entry+1 to put the transcript cursor on at the next draw (grep hits)
 }
 
 // Run drives app from the terminal until the user quits. launched is the
-// default folder for new sessions; claudeJSON is the CLI's settings file, for the theme.
-func Run(app *core.App, launched, claudeJSON string) error {
+// default folder for new sessions.
+func Run(app *core.App, launched string) error {
 	t := uv.DefaultTerminal()
 	scr := t.Screen()
 	scr.EnterAltScreen()
@@ -142,7 +142,6 @@ func Run(app *core.App, launched, claudeJSON string) error {
 	if err := t.Start(); err != nil {
 		return err
 	}
-	th = loadTheme(claudeJSON)
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
 	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
@@ -522,7 +521,7 @@ func (u *UI) choiceLines() []line {
 		}
 		mark, st := "  ", uv.Style{}
 		if c.value == picked && !marked {
-			mark, st, marked = "❯ ", fg(th.permission), true
+			mark, st, marked = "❯ ", fg(th.accent), true
 		}
 		out = append(out, ln(span{mark, st}, span{fmt.Sprintf("%d. ", i+1), dim}, span{c.label, st}))
 		if len(out) == 10 {
@@ -818,6 +817,9 @@ func (u *UI) put(x, y, w int, text string, st uv.Style) {
 	if w <= 0 {
 		return
 	}
+	if st.Bg == nil {
+		st.Bg = u.ambient
+	}
 	u.ctx.SetStyle(st)
 	u.ctx.DrawString(ansi.Truncate(strings.ReplaceAll(text, "\t", "    "), w, "…"), x, y)
 }
@@ -936,7 +938,7 @@ func inline(l string, st uv.Style) []span {
 		if i < 0 {
 			break
 		}
-		mark, inner := "`", uv.Style{Fg: th.permission, Bg: st.Bg, Attrs: st.Attrs}
+		mark, inner := "`", uv.Style{Fg: th.accent, Bg: st.Bg, Attrs: st.Attrs}
 		if l[i] == '*' {
 			if !strings.HasPrefix(l[i:], "**") {
 				out, l = append(out, span{l[:i+1], st}), l[i+1:]
@@ -996,10 +998,7 @@ func (u *UI) draw() {
 	}
 	sw := min(36, W/3)
 	u.drawSidebar(sw, H)
-	for y := 0; y < H; y++ {
-		u.put(sw, y, 1, "│", fg(th.subtle))
-	}
-	x, w := sw+2, W-sw-3
+	x, w := sw+3, W-sw-5
 	scr.HideCursor()
 	s := u.session()
 	var l *core.Live
@@ -1022,7 +1021,12 @@ func (u *UI) draw() {
 	}
 	scr.SetCursorStyle(shape, false)
 	if s == nil {
-		u.put(x, 1, w, "No sessions. Press o to start one, or :e <folder>.", fg(th.inactive))
+		msg := "no sessions · o to start one, or :e <folder>"
+		cy := top/2 - 2
+		for i, row := range logo {
+			u.drawLine(x+(w-logoW)/2, cy+i, logoW, ln(row...))
+		}
+		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(logo)+1, w, msg, fg(th.inactive))
 	} else {
 		lines := u.transcript(s, l, w)
 		old := u.slines
@@ -1131,31 +1135,39 @@ func screenLines(lines []line) []screenLine {
 }
 
 func (u *UI) drawSidebar(w, h int) {
-	title := "Projects"
-	if u.showArchived {
-		title = "Archived"
+	u.ambient = th.panel
+	defer func() { u.ambient = nil }()
+	for y := 0; y < h; y++ {
+		u.put(0, y, w+1, strings.Repeat(" ", w+1), uv.Style{})
 	}
-	u.put(1, 0, w-1, title, uv.Style{Attrs: uv.AttrBold})
+	title := "projects"
+	if u.showArchived {
+		title = "archived"
+	}
+	u.put(2, 0, w-2, title, fg(th.inactive))
 	_, si, rs := u.selRow()
 	top := max(0, si-(h-3)) // keep the selection in view
 	y := 2
 	for i := top; i < len(rs) && y < h; i, y = i+1, y+1 {
 		r := rs[i]
 		sel := i == si
-		caret, st := "  ", uv.Style{}
+		bar, st := " ", fg(th.inactive)
 		if sel && u.pane == paneSidebar {
-			caret, st = "❯ ", fg(th.permission)
+			bar, st = "▎", fg(th.text)
 		} else if sel {
-			st = uv.Style{Attrs: uv.AttrBold}
+			bar, st = "▎", uv.Style{}
 		}
-		u.put(0, y, 2, caret, fg(th.permission))
+		u.put(0, y, 1, bar, fg(th.accent))
 		if r.s == nil {
-			fold := "▾ "
-			if u.collapsed[r.project] {
-				fold = "▸ "
+			if !sel {
+				st = fg(th.inactive)
 			}
-			u.drawLine(2, y, w-2, ln(span{fold + filepath.Base(r.project), with(st, uv.AttrBold)},
-				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.inactive)}))
+			fold := "  "
+			if u.collapsed[r.project] {
+				fold = "+ "
+			}
+			u.drawLine(2, y, w-2, ln(span{fold, fg(th.subtle)}, span{filepath.Base(r.project), st},
+				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.subtle)}))
 			continue
 		}
 		glyph, gst := u.statusGlyph(r.s)
@@ -1167,39 +1179,44 @@ func (u *UI) drawSidebar(w, h int) {
 		if t == "" {
 			t = "New session"
 		}
-		branch := ""
-		if r.s.Branch != "" {
-			branch = "  ⎇ " + strings.TrimPrefix(r.s.Branch, "claude/")
+		branch, tag := "", ""
+		if sel { // details only on the row you're on
+			if r.s.Branch != "" {
+				branch = "  " + strings.TrimPrefix(r.s.Branch, "claude/")
+			}
+			tag = u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
 		}
-		tag := u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
-		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.permission)}, span{t, st}, span{branch, fg(th.inactive)}))
+		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.subtle)}, span{t, st}, span{branch, fg(th.subtle)}))
 	}
-}
-
-func spinnerFrame(start time.Time) string {
-	n := len(spinnerFrames)
-	i := int(time.Since(start)/(120*time.Millisecond)) % (2*n - 2)
-	if i >= n {
-		i = 2*n - 2 - i
-	}
-	return spinnerFrames[i]
 }
 
 // header opens the transcript: the hearth, backend, version, model and where the session runs.
 func (u *UI) header(s *core.Session, l *core.Live) []line {
-	stone, flame, ember, dim := fg(th.inactive), fg(th.claude), fg(th.warning), fg(th.inactive)
+	dim := fg(th.inactive)
 	ver := ""
 	if l.Version != "" {
-		ver = " v" + l.Version
+		ver = " " + l.Version
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
 	gap := span{"   ", uv.Style{}}
 	return []line{
-		ln(span{" ▟▀▀▀▀▀▙", stone}, gap, span{u.app.Backend(s).Label, uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
-		ln(span{" █ ", stone}, span{"▗█▖", flame}, span{" █", stone}, gap, span{model, dim}),
-		ln(span{" █", stone}, span{"▟█", flame}, span{"█", ember}, span{"█▙", flame}, span{"█", stone}, gap, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
+		ln(append(logo[0], gap, span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)})...),
+		ln(append(logo[1], gap, span{model, dim})...),
+		ln(append(logo[2], gap, span{shortPath(s.Cwd) + branchSuffix(s), dim})...),
 	}
 }
+
+// logo is the hearth: a stone fireplace with a vermilion flame and a warm ember at its heart.
+var logo = func() [][]span {
+	stone, flame, ember := fg(th.inactive), fg(th.accent), fg(th.warning)
+	return [][]span{
+		{{" ▟▀▀▀▀▀▙", stone}},
+		{{" █ ", stone}, {"▗█▖", flame}, {" █", stone}},
+		{{" █", stone}, {"▟█", flame}, {"█", ember}, {"█▙", flame}, {"█", stone}},
+	}
+}()
+
+const logoW = 8
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	lines := u.header(s, l)
@@ -1267,8 +1284,8 @@ func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 		}
 	}
 	if l.Running && len(l.Perms) == 0 {
-		cl := fg(th.claude)
-		spin := ln(span{spinnerFrame(l.Started) + " ", cl}, span{l.Verb + "…", cl},
+		dot, cl := ember(l.Started)
+		spin := ln(span{dot + " ", cl}, span{strings.ToLower(l.Verb) + "…", fg(th.text)},
 			span{" (" + core.FormatDuration(time.Since(l.Started)) + " · ctrl+c to interrupt)", dim})
 		spin.deco = true
 		lines = append(lines, line{}, spin)
@@ -1297,7 +1314,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 	cy, cx := -1, 0
 	if s != nil {
 		for i, c := range l.Chips {
-			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.suggestion)}, nil)...)
+			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.inactive)}, nil)...)
 		}
 		if len(l.Chips) > 0 {
 			out = append(out, ln(span{"  :task <n> to start · :dismiss <n>", dim}))
@@ -1321,7 +1338,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 			e := effortGlyphs[s.Effort] + " " + s.Effort + " · :effort"
 			out = append(out, ln(span{strings.Repeat(" ", max(0, w-ansi.StringWidth(e))), uv.Style{}}, span{e, dim}))
 		}
-		rule := ln(span{strings.Repeat("─", w), fg(th.promptBorder)})
+		rule := ln(span{strings.Repeat("─", w), fg(th.subtle)})
 		out = append(out, rule)
 		text := u.ed.text
 		caret := uv.Style{}
@@ -1390,23 +1407,20 @@ func (u *UI) footer(s *core.Session, w int) []line {
 		}
 		return []line{ln(span{"  " + dir + string(u.tv.search.typed), uv.Style{Attrs: uv.AttrBold}})}
 	}
-	vim := "-- " + u.modeName() + " --"
-	left := []span{{"  ", uv.Style{}}, {vim, dim}}
-	cycle := span{" (shift+tab to cycle)", dim}
+	vim := strings.ToLower(u.modeName())
+	left := []span{{"  ", uv.Style{}}, {vim, fg(th.subtle)}}
 	if s != nil {
-		switch s.PermissionMode {
+		switch s.PermissionMode { // manual is the default and says nothing
 		case "acceptEdits":
-			left = append(left, span{" ⏵⏵ accept edits on", fg(th.autoAccept)}, cycle)
+			left = append(left, span{" · accept edits", fg(th.accent)})
 		case "plan":
-			left = append(left, span{" ⏸ plan mode on", fg(th.planMode)}, cycle)
+			left = append(left, span{" · plan", fg(th.accent)})
 		case "auto":
-			left = append(left, span{" ⏵⏵ auto mode on", fg(th.warning)}, cycle)
-		default:
-			left = append(left, span{" ⏸ manual mode on", dim})
+			left = append(left, span{" · auto", fg(th.accent)})
 		}
 	}
-	if vim == "-- NORMAL --" {
-		left = append(left, span{" · ? for shortcuts", dim})
+	if vim == "normal" {
+		left = append(left, span{" · ?", fg(th.subtle)})
 	}
 	out := []line{ln(left...)}
 	if n := u.app.Notice; n != "" {
@@ -1473,7 +1487,7 @@ func alwaysLabel(sug any) string {
 
 // permLines draws the CLI-style permission dialog, or an AskUserQuestion card.
 func (u *UI) permLines(p *core.Perm, w int) []line {
-	dim, perm := fg(th.inactive), fg(th.permission)
+	dim, perm := fg(th.inactive), fg(th.accent)
 	out := []line{ln(span{strings.Repeat("─", w), perm})}
 	if p.Answers != nil {
 		qs := p.Questions()
