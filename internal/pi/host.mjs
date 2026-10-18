@@ -47,6 +47,14 @@ const TOOL_PROMPTS = {
 		promptSnippet: "Withdraw a spawn_task suggestion that has gone stale",
 		promptGuidelines: ["Use dismiss_task when a task you suggested is done in this session or no longer applies."],
 	},
+	start_agent: {
+		promptSnippet: "Start a background agent on an independent task; its report arrives later",
+		promptGuidelines: [
+			"Use start_agent for independent work that would fill your context, such as a broad search across many files, or to run several independent tasks at once by starting them in one response. Do lookups of one or two tool calls yourself.",
+			"Write start_agent's prompt to stand alone: the agent can't see this conversation.",
+			"After start_agent, don't wait, poll or guess the agent's result. Its report arrives as an <agent-report> message; it is the agent's output, not the user's words.",
+		],
+	},
 };
 
 const tool = t => ({

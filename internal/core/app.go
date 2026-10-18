@@ -33,6 +33,7 @@ type Live struct {
 	errored      bool
 	pending      map[string]func(Reply)
 	wantWorktree bool
+	owesParent   bool // an agent whose current turn its parent awaits a report on
 }
 
 type App struct {
@@ -240,6 +241,11 @@ func (a *App) ensureAgent(s *Session) (Agent, error) {
 }
 
 func (a *App) Send(s *Session, text string) error {
+	return a.send(s, text, Entry{Kind: "user", Text: text})
+}
+
+// send sends text to s's agent; shown is what the transcript shows once the agent reads it.
+func (a *App) send(s *Session, text string, shown Entry) error {
 	l := a.L(s.SessionID)
 	if l.wantWorktree {
 		wt, err := a.worktrees.Create(s.OriginCwd, text)
@@ -260,7 +266,8 @@ func (a *App) Send(s *Session, text string) error {
 	if err := ag.SendUser(text, id); err != nil {
 		return err
 	}
-	l.Queued = append(l.Queued, Entry{Kind: "user", Text: text, UUID: id})
+	shown.UUID = id
+	l.Queued = append(l.Queued, shown)
 	startTurn(l)
 	s.LastActivityAt = a.now()
 	a.save(s)
@@ -291,6 +298,9 @@ func (a *App) Unqueue(s *Session, done func(string)) error {
 		return fmt.Errorf("nothing queued")
 	}
 	e := l.Queued[len(l.Queued)-1]
+	if e.Kind != "user" {
+		return fmt.Errorf("the newest queued message is an agent's report, not yours")
+	}
 	l.pending[l.agent.CancelQueued(e.UUID)] = func(r Reply) {
 		if !r.Cancelled {
 			a.Notice = "too late: the agent already read that message"
@@ -528,6 +538,9 @@ func (a *App) Handle(m AgentEvent) {
 			l.Running, l.errored = false, true
 			l.Entries = append(l.Entries, Entry{Kind: "error", Text: fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err)})
 		}
+		if l.owesParent {
+			a.report(s, l, "failed", fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err))
+		}
 	case Initialized:
 		l.Version, l.Model = e.Version, e.Model
 		if e.CLISessionID != "" && e.CLISessionID != s.CLISessionID {
@@ -566,6 +579,16 @@ func (a *App) Handle(m AgentEvent) {
 		default:
 			l.Entries = append(l.Entries, Entry{Kind: "error", Text: e.Failure})
 		}
+		if l.owesParent {
+			switch {
+			case interrupted && !e.OK:
+				a.report(s, l, "stopped", "The user stopped the agent. Its last message:\n\n"+finalMessage(l))
+			case e.OK:
+				a.report(s, l, "completed", finalMessage(l))
+			default:
+				a.report(s, l, "failed", e.Failure+"\n\n"+finalMessage(l))
+			}
+		}
 		if s.TitleSource == "auto" && s.CompletedTurns == 1 {
 			a.requestTitle(s, l)
 		}
@@ -603,6 +626,8 @@ func (a *App) Handle(m AgentEvent) {
 			}
 		}
 		e.Reply("That task was already started or dismissed; do not retry.", false)
+	case AgentRequested:
+		a.startAgent(s, e)
 	case Reply:
 		cb, ok := l.pending[e.RequestID]
 		if !ok {

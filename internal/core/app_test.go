@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -198,5 +199,83 @@ func TestEffortsFollowTheSessionsModel(t *testing.T) {
 	// ... its effort levels are model a's
 	if got := a.Efforts(s); !reflect.DeepEqual(got, []string{"off", "high"}) {
 		t.Fatalf("efforts %v", got)
+	}
+}
+
+func TestAgentReportsItsFinalMessageToTheSessionThatStartedIt(t *testing.T) {
+	// given
+	// ... a pi session in acceptEdits mode whose model starts an agent, which ends its turn with a final message
+	a, f := testApp(t)
+	parent := a.NewSession("/repo", false)
+	a.SetBackend(parent, "pi")
+	a.SetMode(parent, "acceptEdits")
+	parentAgent := withAgent(a, parent)
+	var reply string
+	var replyErr bool
+	a.Handle(AgentEvent{parent.SessionID, CallTool("start_agent", map[string]any{"title": "Find callers", "prompt": "List every caller of Send."},
+		func(text string, isErr bool) { reply, replyErr = text, isErr })})
+	child := a.sessions[0]
+	a.Handle(AgentEvent{child.SessionID, AssistantMessage{Entries: []Entry{{Kind: "assistant", Text: "Send has 3 callers."}}}})
+
+	// when
+	// ... the agent's turn ends, then the user sends the agent a message of their own and that turn ends too
+	a.Handle(AgentEvent{child.SessionID, TurnEnded{OK: true}})
+	a.Send(child, "thanks")
+	a.Handle(AgentEvent{child.SessionID, TurnEnded{OK: true}})
+
+	// then
+	// ... the agent ran linked to the parent on its backend and mode, and the parent heard back once, with the final message
+	childAgent := f.piLauncher.agents[0]
+	if replyErr || !strings.Contains(reply, child.SessionID) || child.SpawnedFrom.SessionID != parent.SessionID || child.SpawnedFrom.Kind != "agent" ||
+		child.Backend != "pi" || child.PermissionMode != "acceptEdits" || child.Cwd != "/repo" || child.Title != "Find callers" ||
+		!strings.Contains(childAgent.sent[0], "List every caller of Send.") {
+		t.Fatalf("reply %q %v child %+v sent %q", reply, replyErr, child, childAgent.sent)
+	}
+	if len(parentAgent.sent) != 1 || !strings.Contains(parentAgent.sent[0], `status="completed"`) || !strings.Contains(parentAgent.sent[0], "Send has 3 callers.") {
+		t.Fatalf("parent sent %q", parentAgent.sent)
+	}
+}
+
+func TestAgentsCannotNestPastTheDepthLimit(t *testing.T) {
+	// given
+	// ... an agent already three levels below the session the user started
+	root := &Session{SessionID: "local_root", Cwd: "/repo", PermissionMode: "default"}
+	c1 := &Session{SessionID: "local_c1", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &SpawnedFrom{SessionID: "local_root", Kind: "agent"}}
+	c2 := &Session{SessionID: "local_c2", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &SpawnedFrom{SessionID: "local_c1", Kind: "agent"}}
+	c3 := &Session{SessionID: "local_c3", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &SpawnedFrom{SessionID: "local_c2", Kind: "agent"}}
+	a, f := testApp(t, root, c1, c2, c3)
+	withAgent(a, c3)
+	var reply string
+	var replyErr bool
+
+	// when
+	// ... it tries to start another agent
+	a.Handle(AgentEvent{c3.SessionID, CallTool("start_agent", map[string]any{"title": "Deeper", "prompt": "Go deeper."},
+		func(text string, isErr bool) { reply, replyErr = text, isErr })})
+
+	// then
+	// ... it is refused with the limit, and no session starts
+	if !replyErr || !strings.Contains(reply, "depth 4 of 3") || len(a.sessions) != 4 || len(f.launcher.agents) != 0 {
+		t.Fatalf("reply %q %v sessions %d", reply, replyErr, len(a.sessions))
+	}
+}
+
+func TestParentHearsWhenItsAgentExitsMidTurn(t *testing.T) {
+	// given
+	// ... a session with a running agent
+	a, _ := testApp(t)
+	parent := a.NewSession("/repo", false)
+	parentAgent := withAgent(a, parent)
+	a.Handle(AgentEvent{parent.SessionID, CallTool("start_agent", map[string]any{"title": "Refactor", "prompt": "Refactor x."}, func(string, bool) {})})
+	child := a.sessions[0]
+
+	// when
+	// ... the agent's process exits before its turn ends
+	a.Handle(AgentEvent{child.SessionID, Exited{Err: errors.New("signal: killed")}})
+
+	// then
+	// ... the parent is told the agent failed, and why
+	if len(parentAgent.sent) != 1 || !strings.Contains(parentAgent.sent[0], `status="failed"`) || !strings.Contains(parentAgent.sent[0], "signal: killed") {
+		t.Fatalf("parent sent %q", parentAgent.sent)
 	}
 }

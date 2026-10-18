@@ -102,6 +102,11 @@ type (
 		TaskID string
 		Reply  func(text string, isErr bool)
 	}
+	// AgentRequested must be answered once through Reply.
+	AgentRequested struct {
+		Title, Prompt string
+		Reply         func(text string, isErr bool)
+	}
 	// Reply answers the request with RequestID; only the fields for that request are set.
 	Reply struct {
 		RequestID string
@@ -130,6 +135,7 @@ func (PermissionRequested) event() {}
 func (PermissionCancelled) event() {}
 func (TaskSuggested) event()       {}
 func (TaskDismissed) event()       {}
+func (AgentRequested) event()      {}
 func (Reply) event()               {}
 func (Exited) event()              {}
 func (ModelsListed) event()        {}
