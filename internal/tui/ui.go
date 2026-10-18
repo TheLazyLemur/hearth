@@ -1023,10 +1023,10 @@ func (u *UI) draw() {
 	if s == nil {
 		msg := "no sessions · o to start one, or :e <folder>"
 		cy := top/2 - 2
-		for i, row := range seal {
-			u.put(x+(w-sealW)/2, cy+i, sealW, row.t, row.st)
+		for i, row := range logo {
+			u.drawLine(x+(w-logoW)/2, cy+i, logoW, ln(row...))
 		}
-		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(seal)+1, w, msg, fg(th.inactive))
+		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(logo)+1, w, msg, fg(th.inactive))
 	} else {
 		lines := u.transcript(s, l, w)
 		old := u.slines
@@ -1200,19 +1200,23 @@ func (u *UI) header(s *core.Session, l *core.Live) []line {
 	model := cmp.Or(s.Model, l.Model, "default model")
 	gap := span{"   ", uv.Style{}}
 	return []line{
-		ln(seal[0], gap, span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)}),
-		ln(seal[1], gap, span{model, dim}),
-		ln(seal[2], gap, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
+		ln(append(logo[0], gap, span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)})...),
+		ln(append(logo[1], gap, span{model, dim})...),
+		ln(append(logo[2], gap, span{shortPath(s.Cwd) + branchSuffix(s), dim})...),
 	}
 }
 
-// seal is the hearth logo: 炉 (ro, hearth) on a vermilion block, about square since cells are twice as tall as wide.
-var seal = func() []span {
-	st := uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold}
-	return []span{{"      ", st}, {"  炉  ", st}, {"      ", st}}
+// logo is the hearth: a stone fireplace with a vermilion flame and a warm ember at its heart.
+var logo = func() [][]span {
+	stone, flame, ember := fg(th.inactive), fg(th.accent), fg(th.warning)
+	return [][]span{
+		{{" ▟▀▀▀▀▀▙", stone}},
+		{{" █ ", stone}, {"▗█▖", flame}, {" █", stone}},
+		{{" █", stone}, {"▟█", flame}, {"█", ember}, {"█▙", flame}, {"█", stone}},
+	}
 }()
 
-const sealW = 6
+const logoW = 8
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	lines := u.header(s, l)
