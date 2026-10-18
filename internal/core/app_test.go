@@ -3,6 +3,8 @@ package core_test
 import (
 	"errors"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"hearth/internal/core"
@@ -213,5 +215,306 @@ func TestEffortsFollowTheSessionsModel(t *testing.T) {
 	// ... its effort levels are model a's
 	if got := a.Efforts(s); !reflect.DeepEqual(got, []string{"off", "high"}) {
 		t.Fatalf("efforts %v", got)
+	}
+}
+
+func TestAgentReportsItsFinalMessageToTheSessionThatStartedIt(t *testing.T) {
+	// given
+	// ... a pi session in acceptEdits mode whose model starts an agent, which ends its turn with a final message
+	a, f := testApp(t)
+	parent := a.NewSession("/repo", false)
+	a.SetBackend(parent, "pi")
+	a.SetMode(parent, "acceptEdits")
+	parentAgent := withAgent(a, parent)
+	var reply string
+	var replyErr bool
+	a.Handle(core.AgentEvent{parent.SessionID, core.CallTool("start_agent", map[string]any{"title": "Find callers", "prompt": "List every caller of Send."},
+		func(text string, isErr bool) { reply, replyErr = text, isErr })})
+	child := a.Sessions()[0]
+	a.Handle(core.AgentEvent{child.SessionID, core.AssistantMessage{Entries: []core.Entry{{Kind: "assistant", Text: "Send has 3 callers."}}}})
+
+	// when
+	// ... the agent's turn ends, then the user sends the agent a message of their own and that turn ends too
+	a.Handle(core.AgentEvent{child.SessionID, core.TurnEnded{OK: true}})
+	a.Send(child, "thanks")
+	a.Handle(core.AgentEvent{child.SessionID, core.TurnEnded{OK: true}})
+
+	// then
+	// ... the agent ran linked to the parent on its backend and mode, and the parent heard back once, with the final message
+	childAgent := f.PiLauncher.Agents[1] // after the parent's own
+	if replyErr || !strings.Contains(reply, child.SessionID) || child.SpawnedFrom.SessionID != parent.SessionID || child.SpawnedFrom.Kind != "agent" ||
+		child.Backend != "pi" || child.PermissionMode != "acceptEdits" || child.Cwd != "/repo" || child.Title != "Find callers" ||
+		!strings.Contains(childAgent.Sent[0], "List every caller of Send.") {
+		t.Fatalf("reply %q %v child %+v sent %q", reply, replyErr, child, childAgent.Sent)
+	}
+	if len(parentAgent.Sent) != 1 || !strings.Contains(parentAgent.Sent[0], `status="completed"`) || !strings.Contains(parentAgent.Sent[0], "Send has 3 callers.") {
+		t.Fatalf("parent sent %q", parentAgent.Sent)
+	}
+}
+
+func TestAgentsCannotNestPastTheDepthLimit(t *testing.T) {
+	// given
+	// ... an agent already three levels below the session the user started
+	root := &core.Session{SessionID: "local_root", Cwd: "/repo", PermissionMode: "default"}
+	c1 := &core.Session{SessionID: "local_c1", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &core.SpawnedFrom{SessionID: "local_root", Kind: "agent"}}
+	c2 := &core.Session{SessionID: "local_c2", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &core.SpawnedFrom{SessionID: "local_c1", Kind: "agent"}}
+	c3 := &core.Session{SessionID: "local_c3", Cwd: "/repo", PermissionMode: "default", SpawnedFrom: &core.SpawnedFrom{SessionID: "local_c2", Kind: "agent"}}
+	a, f := testApp(t, root, c1, c2, c3)
+	withAgent(a, c3)
+	var reply string
+	var replyErr bool
+
+	// when
+	// ... it tries to start another agent
+	a.Handle(core.AgentEvent{c3.SessionID, core.CallTool("start_agent", map[string]any{"title": "Deeper", "prompt": "Go deeper."},
+		func(text string, isErr bool) { reply, replyErr = text, isErr })})
+
+	// then
+	// ... it is refused with the limit, and no session starts
+	if !replyErr || !strings.Contains(reply, "depth 4 of 3") || len(a.Sessions()) != 4 || len(f.Launcher.Agents) != 1 /* c3's own */ {
+		t.Fatalf("reply %q %v sessions %d", reply, replyErr, len(a.Sessions()))
+	}
+}
+
+func TestParentHearsWhenItsAgentExitsMidTurn(t *testing.T) {
+	// given
+	// ... a session with a running agent
+	a, _ := testApp(t)
+	parent := a.NewSession("/repo", false)
+	parentAgent := withAgent(a, parent)
+	a.Handle(core.AgentEvent{parent.SessionID, core.CallTool("start_agent", map[string]any{"title": "Refactor", "prompt": "Refactor x."}, func(string, bool) {})})
+	child := a.Sessions()[0]
+
+	// when
+	// ... the agent's process exits before its turn ends
+	a.Handle(core.AgentEvent{child.SessionID, core.Exited{Err: errors.New("signal: killed")}})
+
+	// then
+	// ... the parent is told the agent failed, and why
+	if len(parentAgent.Sent) != 1 || !strings.Contains(parentAgent.Sent[0], `status="failed"`) || !strings.Contains(parentAgent.Sent[0], "signal: killed") {
+		t.Fatalf("parent sent %q", parentAgent.Sent)
+	}
+}
+
+// listed delivers each backend's model list, as hearth's startup listing would.
+func listed(a *core.App, claude, pi []core.Model) {
+	a.Handle(core.AgentEvent{Event: core.ModelsListed{Backend: core.DefaultBackend, Models: claude}})
+	a.Handle(core.AgentEvent{Event: core.ModelsListed{Backend: "pi", Models: pi}})
+}
+
+// startAgent calls start_agent for parent and returns its reply.
+func startAgent(a *core.App, parent *core.Session, args map[string]any) (reply string, isErr bool) {
+	a.Handle(core.AgentEvent{parent.SessionID, core.CallTool("start_agent", args, func(text string, e bool) { reply, isErr = text, e })})
+	return reply, isErr
+}
+
+func TestStartupListingPutsEveryBackendsModelsInTheAgentTool(t *testing.T) {
+	// given
+	// ... each backend offers one model
+	a, f := testApp(t)
+	f.Launcher.Offers = []core.Model{{ID: "opus", Name: "Opus", Efforts: []string{"low", "high"}}}
+	f.PiLauncher.Offers = []core.Model{{ID: "ollama/flash", Name: "Flash"}}
+	a.ListModels("/repo")
+	a.Handle(<-a.Events())
+	a.Handle(<-a.Events())
+
+	// when
+	// ... a session launches
+	a.Send(a.NewSession("/repo", false), "hi")
+
+	// then
+	// ... its start_agent description lists both backends' models with their effort levels
+	desc := f.Launcher.Tools[2]["description"].(string)
+	if !strings.Contains(desc, "claude: opus (Opus), effort low|high") || !strings.Contains(desc, "pi: ollama/flash (Flash), no effort setting") {
+		t.Fatalf("description %q", desc)
+	}
+}
+
+func TestAgentRunsOnTheBackendModelAndEffortItAsksFor(t *testing.T) {
+	// given
+	// ... a Claude session and a pi model with two effort levels
+	a, f := testApp(t)
+	listed(a, nil, []core.Model{{ID: "ollama/flash", Efforts: []string{"low", "high"}}})
+	parent := a.NewSession("/repo", false)
+	withAgent(a, parent)
+
+	// when
+	// ... it starts an agent on that pi model at low effort
+	reply, isErr := startAgent(a, parent, map[string]any{"title": "Search", "prompt": "Find x.", "backend": "pi", "model": "ollama/flash", "effort": "low"})
+
+	// then
+	// ... the agent runs on pi with that model and effort, and the reply says so
+	child := a.Sessions()[0]
+	if isErr || child.Backend != "pi" || child.Model != "ollama/flash" || child.Effort != "low" || len(f.PiLauncher.Agents) != 1 ||
+		!strings.Contains(reply, "on pi, model ollama/flash, effort low") {
+		t.Fatalf("reply %q %v child %+v", reply, isErr, child)
+	}
+}
+
+func TestAgentKeepsTheParentsEffortOnlyWhenItsModelHasIt(t *testing.T) {
+	// given
+	// ... a session at xhigh effort, and pi models with and without xhigh
+	a, _ := testApp(t)
+	listed(a, nil, []core.Model{{ID: "ollama/big", Efforts: []string{"high", "xhigh"}}, {ID: "ollama/small", Efforts: []string{"low", "high"}}})
+	parent := a.NewSession("/repo", false)
+	a.SetEffort(parent, "xhigh")
+	withAgent(a, parent)
+
+	// when
+	// ... it starts one agent on each model without naming an effort
+	startAgent(a, parent, map[string]any{"title": "Big", "prompt": "x", "backend": "pi", "model": "ollama/big"})
+	startAgent(a, parent, map[string]any{"title": "Small", "prompt": "x", "backend": "pi", "model": "ollama/small"})
+
+	// then
+	// ... the model with xhigh keeps it, and the other uses its default
+	big, small := a.Sessions()[1], a.Sessions()[0]
+	if big.Effort != "xhigh" || small.Effort != "" {
+		t.Fatalf("big %q small %q", big.Effort, small.Effort)
+	}
+}
+
+func TestAgentOnABackendAloneUsesThatBackendsDefaultModel(t *testing.T) {
+	// given
+	// ... a Claude session on opus at high effort
+	a, _ := testApp(t)
+	listed(a, []core.Model{{ID: "opus", Efforts: []string{"high"}}}, nil)
+	parent := a.NewSession("/repo", false)
+	a.SetModel(parent, "opus")
+	a.SetEffort(parent, "high")
+	withAgent(a, parent)
+
+	// when
+	// ... it starts an agent naming only the pi backend
+	startAgent(a, parent, map[string]any{"title": "Search", "prompt": "x", "backend": "pi"})
+
+	// then
+	// ... the agent runs on pi's default model, at its default effort
+	child := a.Sessions()[0]
+	if child.Backend != "pi" || child.Model != "" || child.Effort != "" {
+		t.Fatalf("child %+v", child)
+	}
+}
+
+func TestStartAgentRefusesWhatItCannotHonour(t *testing.T) {
+	flash := []core.Model{{ID: "ollama/flash", Efforts: []string{"low", "high"}}}
+	cases := []struct {
+		name   string
+		lists  func(a *core.App)
+		args   map[string]any
+		reason string
+	}{
+		{"unknown backend", func(a *core.App) { listed(a, nil, flash) }, map[string]any{"backend": "gemini"}, "unknown backend \"gemini\"; choose one of: claude, pi"},
+		{"unknown model", func(a *core.App) { listed(a, nil, flash) }, map[string]any{"backend": "pi", "model": "ollama/nope"}, "pi has no model \"ollama/nope\"; choose one of: ollama/flash"},
+		{"unsupported effort", func(a *core.App) { listed(a, nil, flash) }, map[string]any{"backend": "pi", "model": "ollama/flash", "effort": "max"}, "ollama/flash has no effort \"max\"; choose one of: low, high"},
+		{"lists loading", func(a *core.App) { a.ListModels("/repo") }, map[string]any{"backend": "pi", "model": "ollama/flash"}, "model lists are still loading"},
+		{"listing failed", func(a *core.App) {
+			a.Handle(core.AgentEvent{Event: core.ModelsListed{Backend: "pi", Err: errors.New("exec: pi not found")}})
+		}, map[string]any{"backend": "pi", "model": "ollama/flash"}, "pi is not available: listing models: exec: pi not found"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a session and the model lists of this case
+			a, _ := testApp(t)
+			c.lists(a)
+			parent := a.NewSession("/repo", false)
+			withAgent(a, parent)
+			c.args["title"], c.args["prompt"] = "Task", "Do x."
+
+			// when
+			// ... it asks for an agent hearth cannot honour
+			reply, isErr := startAgent(a, parent, c.args)
+
+			// then
+			// ... the call is refused with the reason, and no agent starts
+			if !isErr || !strings.Contains(reply, c.reason) || len(a.Sessions()) != 1 {
+				t.Fatalf("reply %q %v sessions %d", reply, isErr, len(a.Sessions()))
+			}
+		})
+	}
+}
+
+func TestAgentsLeaveTheSidebarAndListUnderTheSessionTheUserStarted(t *testing.T) {
+	// given
+	// ... a session the user started, its agent, that agent's own agent, and an agent whose parent was deleted
+	root := &core.Session{SessionID: "local_root", Cwd: "/repo", CreatedAt: 1}
+	c1 := &core.Session{SessionID: "local_c1", Cwd: "/repo", CreatedAt: 2, SpawnedFrom: &core.SpawnedFrom{SessionID: "local_root", Kind: "agent"}}
+	c2 := &core.Session{SessionID: "local_c2", Cwd: "/repo", CreatedAt: 3, SpawnedFrom: &core.SpawnedFrom{SessionID: "local_c1", Kind: "agent"}}
+	orphan := &core.Session{SessionID: "local_orphan", Cwd: "/repo", CreatedAt: 4, SpawnedFrom: &core.SpawnedFrom{SessionID: "local_gone", Kind: "agent"}}
+	a, _ := testApp(t, c2, orphan, root, c1)
+
+	// when
+	// ... the sidebar's sessions, the nested agent's root and the root's agents are asked for
+	visible, top, agents := a.Visible(false), a.Root(c2), a.Agents()["local_root"]
+
+	// then
+	// ... the sidebar keeps the root and the orphan, and both agents list under the root, oldest first
+	ids := func(ss []*core.Session) (out []string) {
+		for _, s := range ss {
+			out = append(out, s.SessionID)
+		}
+		return out
+	}
+	if !slices.Equal(ids(visible), []string{"local_orphan", "local_root"}) || top != root || !slices.Equal(ids(agents), []string{"local_c1", "local_c2"}) {
+		t.Fatalf("visible %v root %s agents %v", ids(visible), top.SessionID, ids(agents))
+	}
+}
+
+func TestAgentKeepsHowItsLastTurnEnded(t *testing.T) {
+	cases := []struct {
+		name      string
+		work      []core.Event
+		end       core.TurnEnded
+		report    string
+		retryable bool
+	}{
+		{"finished", []core.Event{core.AssistantMessage{Entries: []core.Entry{{Kind: "assistant", Text: "Done."}}}}, core.TurnEnded{OK: true}, "completed", false},
+		{"overloaded after doing work", []core.Event{core.AssistantMessage{Entries: []core.Entry{{Kind: "assistant", Text: "Halfway."}}}},
+			core.TurnEnded{Failure: `error_during_execution ["API Error: 529 Overloaded"]`}, "failed", true},
+		{"overloaded before doing anything", nil, core.TurnEnded{Failure: `error_during_execution ["API Error: 529 Overloaded"]`}, "failed", false},
+		{"out of turns", []core.Event{core.AssistantMessage{Entries: []core.Entry{{Kind: "assistant", Text: "Halfway."}}}},
+			core.TurnEnded{Failure: `error_max_turns []`}, "failed", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a session whose agent did this case's work
+			a, _ := testApp(t)
+			parent := a.NewSession("/repo", false)
+			withAgent(a, parent)
+			startAgent(a, parent, map[string]any{"title": "Find callers", "prompt": "List callers."})
+			child := a.Sessions()[0]
+			for _, e := range c.work {
+				a.Handle(core.AgentEvent{child.SessionID, e})
+			}
+
+			// when
+			// ... the agent's turn ends
+			a.Handle(core.AgentEvent{child.SessionID, c.end})
+
+			// then
+			// ... the agent keeps how it ended, and the parent shows a line that names the agent
+			l, shown := a.L(child.SessionID), a.L(parent.SessionID).Queued
+			if l.Report != c.report || l.Retryable != c.retryable || len(shown) != 1 || shown[0].ID != child.SessionID {
+				t.Fatalf("report %q retryable %v shown %+v", l.Report, l.Retryable, shown)
+			}
+		})
+	}
+}
+
+func TestReloadedReportReadsAsTheAgentLine(t *testing.T) {
+	// given
+	// ... a report as hearth sends it to a parent, its title quoted
+	text := "<agent-report session=\"local_c1\" title=\"Find \\\"Send\\\" callers\" status=\"failed\">\nboom\n</agent-report>\nThis report comes from an agent you started, not from the user."
+
+	// when
+	// ... a reloaded transcript reads it, and a message the user typed
+	e, ok := core.ReportEntry(text)
+	_, typed := core.ReportEntry("<b>not a report</b>")
+
+	// then
+	// ... the report becomes the parent's agent line, and the typed message isn't one
+	if !ok || typed || e.Kind != "info" || e.ID != "local_c1" || e.Text != `↳ agent "Find \"Send\" callers" failed` {
+		t.Fatalf("entry %+v ok %v typed %v", e, ok, typed)
 	}
 }

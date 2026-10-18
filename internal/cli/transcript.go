@@ -60,6 +60,9 @@ func entriesFromMessage(m map[string]any) []core.Entry {
 	switch m["type"] {
 	case "user":
 		if s, ok := msg["content"].(string); ok {
+			if e, ok := core.ReportEntry(s); ok {
+				return []core.Entry{e}
+			}
 			if strings.HasPrefix(s, "<") { // command/system wrappers, not typed by the user
 				return nil
 			}
@@ -74,6 +77,8 @@ func entriesFromMessage(m map[string]any) []core.Entry {
 			case "text":
 				if t, _ := b["text"].(string); strings.HasPrefix(t, "[Request interrupted") {
 					out = append(out, core.Entry{Kind: "interrupt"})
+				} else if e, ok := core.ReportEntry(t); ok {
+					out = append(out, e)
 				} else if t != "" && !strings.HasPrefix(t, "<") {
 					out = append(out, core.Entry{Kind: "user", Text: t, UUID: uuid})
 				}

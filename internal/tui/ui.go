@@ -22,7 +22,6 @@ import (
 var (
 	modes   = []string{"default", "acceptEdits", "plan", "auto"}
 	efforts = []string{"", "low", "medium", "high", "xhigh", "max"}
-	th      = themes["dark"]
 )
 
 const (
@@ -126,17 +125,20 @@ type UI struct {
 	permSel      int    // highlighted permission dialog option
 	help         bool   // shortcut hints shown under the footer
 	quit         bool
-	launched     string  // default folder for new sessions
-	pick         *picker // the open session or grep picker
-	lead         bool    // the last key was a lone space: the start of a picker chord
-	jump         int     // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	launched     string                     // default folder for new sessions
+	pick         *picker                    // the open session or grep picker
+	ambient      color.Color                // background for draws that set none: the sidebar or picker card being painted
+	lead         bool                       // the last key was a lone space: the start of a picker chord
+	jump         int                        // entry+1 to put the transcript cursor on at the next draw (grep hits)
+	tabs         map[string][]*tab          // agent tabs by the session the user started
+	agents       map[string][]*core.Session // every root's agents, as of the last syncTabs
+	count        int                        // tab number typed before gt
+	now          func() time.Time
 }
 
 // Run drives a daemon's app from the terminal until the user quits; quitting only detaches,
-// so the daemon and its agents keep running. launched is the default folder for new
-// sessions; claudeJSON is the CLI's settings file, for the theme.
-func Run(app Client, launched, claudeJSON string) error {
-	th = loadTheme(claudeJSON)
+// so the daemon and its agents keep running. launched is the default folder for new sessions.
+func Run(app Client, launched string) error {
 	t := uv.DefaultTerminal()
 	scr := t.Screen()
 	scr.EnterAltScreen()
@@ -146,7 +148,7 @@ func Run(app Client, launched, claudeJSON string) error {
 	}
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
-	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched}
+	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched, tabs: map[string][]*tab{}, now: time.Now}
 	if vs := app.Visible(false); len(vs) > 0 {
 		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
 	}
@@ -166,7 +168,7 @@ func Run(app Client, launched, claudeJSON string) error {
 			}
 			u.event(ev)
 		case <-tick.C:
-			if !fresh && !u.app.AnyRunning() {
+			if !fresh && !u.app.AnyRunning() && !u.closing() {
 				continue
 			}
 		}
@@ -366,6 +368,25 @@ func (u *UI) sidebarKey(seq string) {
 func (u *UI) inputKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	normal := u.ed.mode == modeNormal
+	if normal && u.ed.pendingOp == 0 { // the editor leaves g and counts free: gt, gT and {n}gt switch tabs
+		switch {
+		case u.op == "g":
+			count := u.count
+			u.op, u.count = "", 0
+			if char == 'T' {
+				u.switchTab(s, false, 0)
+			} else if char == 't' {
+				u.switchTab(s, true, count)
+			}
+			return
+		case char == 'g':
+			u.op = "g"
+			return
+		case u.tabKey(char):
+			return
+		}
+		u.count = 0
+	}
 	switch {
 	case k.MatchString("ctrl+s"):
 		u.submit(s, true)
@@ -404,7 +425,15 @@ func (u *UI) inputKey(s *core.Session, k uv.KeyPressEvent) {
 func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	tv := &u.tv
+	defer func() {
+		if u.focus == focusInput { // left for the prompt: hold the scroll unless it was at the newest output
+			tv.held = tv.scrollTop < len(u.slines)-u.view
+		}
+	}()
 	if !tv.search.typing && tv.visual == visualOff && tv.pendingKey == 0 && !tv.pendingWindowCmd {
+		if u.tabKey(char) {
+			return
+		}
 		op := u.op
 		u.op = ""
 		switch {
@@ -437,6 +466,10 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 			return
 		}
 	}
+	count := u.count
+	if char != 'g' || tv.pendingKey != 0 {
+		u.count = 0
+	}
 	act := tv.handleKey(u.slines, u.view, &u.register, char, key)
 	if tv.note != "" {
 		u.app.SetNotice(tv.note)
@@ -455,12 +488,24 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 		u.ask(":", "", u.command)
 	case viewQuit:
 		u.app.SetNotice("type :q to quit")
+	case viewNextTab:
+		u.switchTab(s, true, count)
+	case viewPrevTab:
+		u.switchTab(s, false, 0)
+	case viewGoToFile:
+		if ag := u.agentLineAt(s); ag != nil {
+			u.openTab(ag)
+		} else {
+			u.app.SetNotice("gf: no agent on this line")
+		}
 	}
 }
 
 func (u *UI) focusView() {
 	u.focus = focusView
-	u.tv.focusLastLine(u.slines, u.view)
+	if !u.tv.held { // a held transcript keeps its cursor where the view left it
+		u.tv.focusLastLine(u.slines, u.view)
+	}
 }
 
 // submit sends the prompt (queued by the CLI if a turn is running), or answers a question.
@@ -484,6 +529,12 @@ func (u *UI) submit(s *core.Session, interrupt bool) {
 		return
 	}
 	u.ed.reset()
+	u.tv.held = false
+	if root := u.app.Root(s); root != s { // typed into an agent: its tab stays until closed
+		if i := tabIndex(u.tabs[root.SessionID], s.SessionID); i >= 0 {
+			u.tabs[root.SessionID][i].pinned = true
+		}
+	}
 }
 
 // pickModel offers s's backend models; typing filters them, a number or enter picks, unlisted text is taken as an id.
@@ -526,7 +577,7 @@ func (u *UI) choiceLines() []line {
 		}
 		mark, st := "  ", uv.Style{}
 		if c.value == picked && !marked {
-			mark, st, marked = "❯ ", fg(th.permission), true
+			mark, st, marked = "❯ ", fg(th.accent), true
 		}
 		out = append(out, ln(span{mark, st}, span{fmt.Sprintf("%d. ", i+1), dim}, span{c.label, st}))
 		if len(out) == 10 {
@@ -612,7 +663,14 @@ func (u *UI) command(line string) {
 	switch name {
 	case "":
 		return
-	case "q", "q!", "qa", "qa!", "quit", "wq", "x":
+	case "q", "q!":
+		if s != nil && u.app.Root(s) != s { // on an agent's tab, :q closes the tab
+			u.closeTab(s)
+			return
+		}
+		u.quit = true
+		return
+	case "qa", "qa!", "quit", "wq", "x":
 		u.quit = true
 		return
 	case "e", "edit", "new":
@@ -683,6 +741,8 @@ func (u *UI) command(line string) {
 		}
 	case "dismiss":
 		u.app.DismissChip(s, n-1)
+	case "tabclose", "tabc":
+		u.closeTab(s)
 	case "unqueue":
 		u.unqueue(s)
 	case "star":
@@ -825,6 +885,9 @@ func (u *UI) put(x, y, w int, text string, st uv.Style) {
 	if w <= 0 {
 		return
 	}
+	if st.Bg == nil {
+		st.Bg = u.ambient
+	}
 	u.ctx.SetStyle(st)
 	u.ctx.DrawString(ansi.Truncate(strings.ReplaceAll(text, "\t", "    "), w, "…"), x, y)
 }
@@ -943,7 +1006,7 @@ func inline(l string, st uv.Style) []span {
 		if i < 0 {
 			break
 		}
-		mark, inner := "`", uv.Style{Fg: th.permission, Bg: st.Bg, Attrs: st.Attrs}
+		mark, inner := "`", uv.Style{Fg: th.accent, Bg: st.Bg, Attrs: st.Attrs}
 		if l[i] == '*' {
 			if !strings.HasPrefix(l[i:], "**") {
 				out, l = append(out, span{l[:i+1], st}), l[i+1:]
@@ -1001,12 +1064,10 @@ func (u *UI) draw() {
 		scr.Flush()
 		return
 	}
+	u.syncTabs()
 	sw := min(36, W/3)
 	u.drawSidebar(sw, H)
-	for y := 0; y < H; y++ {
-		u.put(sw, y, 1, "│", fg(th.subtle))
-	}
-	x, w := sw+2, W-sw-3
+	x, w := sw+3, W-sw-5
 	scr.HideCursor()
 	s := u.session()
 	var l *core.Live
@@ -1029,11 +1090,21 @@ func (u *UI) draw() {
 	}
 	scr.SetCursorStyle(shape, false)
 	if s == nil {
-		u.put(x, 1, w, "No sessions. Press o to start one, or :e <folder>.", fg(th.inactive))
+		msg := "no sessions · o to start one, or :e <folder>"
+		cy := top/2 - 2
+		for i, row := range logo {
+			u.drawLine(x+(w-logoW)/2, cy+i, logoW, ln(row...))
+		}
+		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(logo)+1, w, msg, fg(th.inactive))
 	} else {
+		y0 := 0 // the tab line, when there is one, sits above the transcript
+		if tl := u.tabLine(s); tl != nil {
+			u.drawLine(x, 0, w, *tl)
+			y0 = 1
+		}
 		lines := u.transcript(s, l, w)
 		old := u.slines
-		u.slines, u.view = screenLines(lines), max(1, top-1)
+		u.slines, u.view = screenLines(lines), max(1, top-1-y0)
 		if raw := u.rawMarkdown(); raw != u.raw { // replies reflowed: keep the cursor on what it was on
 			u.raw = raw
 			was := u.tv.cursor.line
@@ -1047,15 +1118,17 @@ func (u *UI) draw() {
 		viewing := u.pane == paneSession && u.focus == focusView
 		if viewing {
 			u.tv.clampAndScroll(u.slines, u.view)
+		} else if u.tv.held {
+			u.tv.scrollTop = min(u.tv.scrollTop, max(0, len(lines)-u.view))
 		} else {
 			u.tv.scrollTop = max(0, len(lines)-u.view) // follow the newest output
 		}
 		start := u.tv.scrollTop
 		for i := 0; i < u.view && start+i < len(lines); i++ {
-			u.drawLine(x, i, w, lines[start+i])
+			u.drawLine(x, y0+i, w, lines[start+i])
 		}
 		if viewing {
-			u.drawViewMarks(x, start, cy < 0)
+			u.drawViewMarks(x, y0, start, cy < 0)
 		}
 	}
 	if u.pick != nil {
@@ -1070,7 +1143,7 @@ func (u *UI) draw() {
 
 // drawViewMarks reverses the visual selection and search matches, and puts the
 // terminal cursor on the transcript cursor.
-func (u *UI) drawViewMarks(x, start int, showCursor bool) {
+func (u *UI) drawViewMarks(x, y0, start int, showCursor bool) {
 	vs, ve := u.tv.selection()
 	pat := u.tv.search.pattern
 	for i := 0; i < u.view && start+i < len(u.slines); i++ {
@@ -1089,7 +1162,7 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 			}
 		}
 		markMatches(hit, cells, pat)
-		u.reverseCells(x, i, cells, hit)
+		u.reverseCells(x, y0+i, cells, hit)
 	}
 	if c := u.tv.cursor; showCursor && c.line >= start && c.line < start+u.view && c.line < len(u.slines) {
 		cells := u.slines[c.line].cells
@@ -1097,7 +1170,7 @@ func (u *UI) drawViewMarks(x, start int, showCursor bool) {
 		for _, ce := range cells[:min(c.col, len(cells))] {
 			cx += ansi.StringWidth(string(ce.char))
 		}
-		u.scr.SetCursorPosition(cx, c.line-start)
+		u.scr.SetCursorPosition(cx, y0+c.line-start)
 		u.scr.ShowCursor()
 	}
 }
@@ -1138,34 +1211,49 @@ func screenLines(lines []line) []screenLine {
 }
 
 func (u *UI) drawSidebar(w, h int) {
-	title := "Projects"
-	if u.showArchived {
-		title = "Archived"
+	u.ambient = th.panel
+	defer func() { u.ambient = nil }()
+	for y := 0; y < h; y++ {
+		u.put(0, y, w+1, strings.Repeat(" ", w+1), uv.Style{})
 	}
-	u.put(1, 0, w-1, title, uv.Style{Attrs: uv.AttrBold})
+	title := "projects"
+	if u.showArchived {
+		title = "archived"
+	}
+	u.put(2, 0, w-2, title, fg(th.inactive))
 	_, si, rs := u.selRow()
 	top := max(0, si-(h-3)) // keep the selection in view
 	y := 2
 	for i := top; i < len(rs) && y < h; i, y = i+1, y+1 {
 		r := rs[i]
 		sel := i == si
-		caret, st := "  ", uv.Style{}
+		bar, st := " ", fg(th.inactive)
 		if sel && u.pane == paneSidebar {
-			caret, st = "❯ ", fg(th.permission)
+			bar, st = "▎", fg(th.text)
 		} else if sel {
-			st = uv.Style{Attrs: uv.AttrBold}
+			bar, st = "▎", uv.Style{}
 		}
-		u.put(0, y, 2, caret, fg(th.permission))
+		u.put(0, y, 1, bar, fg(th.accent))
 		if r.s == nil {
-			fold := "▾ "
-			if u.collapsed[r.project] {
-				fold = "▸ "
+			if !sel {
+				st = fg(th.inactive)
 			}
-			u.drawLine(2, y, w-2, ln(span{fold + filepath.Base(r.project), with(st, uv.AttrBold)},
-				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.inactive)}))
+			fold := "  "
+			if u.collapsed[r.project] {
+				fold = "+ "
+			}
+			u.drawLine(2, y, w-2, ln(span{fold, fg(th.subtle)}, span{filepath.Base(r.project), st},
+				span{"  " + shortPath(filepath.Dir(r.project)), fg(th.subtle)}))
 			continue
 		}
 		glyph, gst := u.statusGlyph(r.s)
+		agents := ""
+		if n, waiting := u.agentsOf(r.s); n > 0 {
+			agents = fmt.Sprintf("  %d agent%s", n, map[bool]string{true: "s"}[n > 1])
+			if waiting && u.app.Status(r.s) != "waiting" { // an agent needs the user: the row says so
+				glyph, gst = "?", fg(th.accent)
+			}
+		}
 		star := "  "
 		if r.s.IsStarred {
 			star = "★ "
@@ -1174,39 +1262,44 @@ func (u *UI) drawSidebar(w, h int) {
 		if t == "" {
 			t = "New session"
 		}
-		branch := ""
-		if r.s.Branch != "" {
-			branch = "  ⎇ " + strings.TrimPrefix(r.s.Branch, "claude/")
+		branch, tag := "", ""
+		if sel { // details only on the row you're on
+			if r.s.Branch != "" {
+				branch = "  " + strings.TrimPrefix(r.s.Branch, "claude/")
+			}
+			tag = u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
 		}
-		tag := u.app.Backend(r.s).Tag + " " // before the title, which truncation would cut it from
-		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.permission)}, span{t, st}, span{branch, fg(th.inactive)}))
+		u.drawLine(4, y, w-4, ln(span{glyph + " ", gst}, span{star, fg(th.warning)}, span{tag, fg(th.subtle)}, span{t, st}, span{agents, fg(th.subtle)}, span{branch, fg(th.subtle)}))
 	}
-}
-
-func spinnerFrame(start time.Time) string {
-	n := len(spinnerFrames)
-	i := int(time.Since(start)/(120*time.Millisecond)) % (2*n - 2)
-	if i >= n {
-		i = 2*n - 2 - i
-	}
-	return spinnerFrames[i]
 }
 
 // header opens the transcript: the hearth, backend, version, model and where the session runs.
 func (u *UI) header(s *core.Session, l *core.Live) []line {
-	stone, flame, ember, dim := fg(th.inactive), fg(th.claude), fg(th.warning), fg(th.inactive)
+	dim := fg(th.inactive)
 	ver := ""
 	if l.Version != "" {
-		ver = " v" + l.Version
+		ver = " " + l.Version
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
 	gap := span{"   ", uv.Style{}}
 	return []line{
-		ln(span{" ▟▀▀▀▀▀▙", stone}, gap, span{u.app.Backend(s).Label, uv.Style{Attrs: uv.AttrBold}}, span{ver, dim}),
-		ln(span{" █ ", stone}, span{"▗█▖", flame}, span{" █", stone}, gap, span{model, dim}),
-		ln(span{" █", stone}, span{"▟█", flame}, span{"█", ember}, span{"█▙", flame}, span{"█", stone}, gap, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
+		ln(append(logo[0], gap, span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)})...),
+		ln(append(logo[1], gap, span{model, dim})...),
+		ln(append(logo[2], gap, span{shortPath(s.Cwd) + branchSuffix(s), dim})...),
 	}
 }
+
+// logo is the hearth: a stone fireplace with a vermilion flame and a warm ember at its heart.
+var logo = func() [][]span {
+	stone, flame, ember := fg(th.inactive), fg(th.accent), fg(th.warning)
+	return [][]span{
+		{{" ▟▀▀▀▀▀▙", stone}},
+		{{" █ ", stone}, {"▗█▖", flame}, {" █", stone}},
+		{{" █", stone}, {"▟█", flame}, {"█", ember}, {"█▙", flame}, {"█", stone}},
+	}
+}()
+
+const logoW = 8
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	lines := u.header(s, l)
@@ -1274,8 +1367,8 @@ func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 		}
 	}
 	if l.Running && len(l.Perms) == 0 {
-		cl := fg(th.claude)
-		spin := ln(span{spinnerFrame(l.Started) + " ", cl}, span{l.Verb + "…", cl},
+		dot, cl := ember(l.Started)
+		spin := ln(span{dot + " ", cl}, span{strings.ToLower(l.Verb) + "…", fg(th.text)},
 			span{" (" + core.FormatDuration(time.Since(l.Started)) + " · ctrl+c to interrupt)", dim})
 		spin.deco = true
 		lines = append(lines, line{}, spin)
@@ -1304,7 +1397,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 	cy, cx := -1, 0
 	if s != nil {
 		for i, c := range l.Chips {
-			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.suggestion)}, nil)...)
+			out = append(out, wrap([]span{{c.Title + " — " + c.Tldr, uv.Style{}}}, w, span{fmt.Sprintf("◆ task %d  ", i+1), fg(th.inactive)}, nil)...)
 		}
 		if len(l.Chips) > 0 {
 			out = append(out, ln(span{"  :task <n> to start · :dismiss <n>", dim}))
@@ -1328,7 +1421,7 @@ func (u *UI) bottom(s *core.Session, l *core.Live, w int) ([]line, int, int) {
 			e := effortGlyphs[s.Effort] + " " + s.Effort + " · :effort"
 			out = append(out, ln(span{strings.Repeat(" ", max(0, w-ansi.StringWidth(e))), uv.Style{}}, span{e, dim}))
 		}
-		rule := ln(span{strings.Repeat("─", w), fg(th.promptBorder)})
+		rule := ln(span{strings.Repeat("─", w), fg(th.subtle)})
 		out = append(out, rule)
 		text := u.ed.text
 		caret := uv.Style{}
@@ -1397,23 +1490,20 @@ func (u *UI) footer(s *core.Session, w int) []line {
 		}
 		return []line{ln(span{"  " + dir + string(u.tv.search.typed), uv.Style{Attrs: uv.AttrBold}})}
 	}
-	vim := "-- " + u.modeName() + " --"
-	left := []span{{"  ", uv.Style{}}, {vim, dim}}
-	cycle := span{" (shift+tab to cycle)", dim}
+	vim := strings.ToLower(u.modeName())
+	left := []span{{"  ", uv.Style{}}, {vim, fg(th.subtle)}}
 	if s != nil {
-		switch s.PermissionMode {
+		switch s.PermissionMode { // manual is the default and says nothing
 		case "acceptEdits":
-			left = append(left, span{" ⏵⏵ accept edits on", fg(th.autoAccept)}, cycle)
+			left = append(left, span{" · accept edits", fg(th.accent)})
 		case "plan":
-			left = append(left, span{" ⏸ plan mode on", fg(th.planMode)}, cycle)
+			left = append(left, span{" · plan", fg(th.accent)})
 		case "auto":
-			left = append(left, span{" ⏵⏵ auto mode on", fg(th.warning)}, cycle)
-		default:
-			left = append(left, span{" ⏸ manual mode on", dim})
+			left = append(left, span{" · auto", fg(th.accent)})
 		}
 	}
-	if vim == "-- NORMAL --" {
-		left = append(left, span{" · ? for shortcuts", dim})
+	if vim == "normal" {
+		left = append(left, span{" · ?", fg(th.subtle)})
 	}
 	out := []line{ln(left...)}
 	if n := u.app.Notice(); n != "" {
@@ -1429,7 +1519,8 @@ func (u *UI) footer(s *core.Session, w int) []line {
 			help = "INSERT  enter send/queue · ctrl+s interrupt+send · ctrl+j newline · esc → NORMAL\n" +
 				"NORMAL  h j k l w b e 0 ^ $ · d c y + motion, dd cc yy · x X r D C · o O p P u · enter send · i a I A · k on top line → VIEW · esc interrupt\n" +
 				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
-				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt\n" +
+				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt · gf open agent\n" +
+				"TABS    gt gT {n}gt switch · :tabclose or :q close an agent's tab\n" +
 				"        space space sessions · space / grep · ctrl+h list · :backend :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
 		}
 		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
@@ -1480,7 +1571,7 @@ func alwaysLabel(sug any) string {
 
 // permLines draws the CLI-style permission dialog, or an AskUserQuestion card.
 func (u *UI) permLines(p *core.Perm, w int) []line {
-	dim, perm := fg(th.inactive), fg(th.permission)
+	dim, perm := fg(th.inactive), fg(th.accent)
 	out := []line{ln(span{strings.Repeat("─", w), perm})}
 	if p.Answers != nil {
 		qs := p.Questions()

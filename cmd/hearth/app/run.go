@@ -35,13 +35,11 @@ func Run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("working directory: %w", err)
 	}
-	// the CLI keeps .claude.json beside ~/.claude unless CLAUDE_CONFIG_DIR moves both
-	claudeJSON := filepath.Join(cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), home), ".claude.json")
 	c, err := daemon.Attach(dir)
 	if err != nil {
 		return err
 	}
-	if err := tui.Run(c, launched, claudeJSON); errors.Is(err, daemon.ErrGone) {
+	if err := tui.Run(c, launched); errors.Is(err, daemon.ErrGone) {
 		return fmt.Errorf("daemon exited, see %s", daemon.LogPath(dir))
 	} else if err != nil {
 		return err
@@ -127,5 +125,10 @@ func newApp(dir, home string) (*core.App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load sessions: %w", err)
 	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("working directory: %w", err)
+	}
+	app.ListModels(wd)
 	return app, nil
 }

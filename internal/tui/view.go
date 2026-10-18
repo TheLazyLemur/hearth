@@ -38,6 +38,8 @@ const (
 	viewCollapseAll
 	viewCommand
 	viewGoToFile
+	viewNextTab
+	viewPrevTab
 )
 
 type search struct {
@@ -52,6 +54,7 @@ type transcriptView struct {
 	cursor           position
 	stickyCol        int
 	scrollTop        int
+	held             bool // left scrolled up: the prompt doesn't snap it to the newest output
 	pendingKey       rune
 	pendingWindowCmd bool
 
@@ -147,6 +150,9 @@ func (v *transcriptView) handleKey(lines []screenLine, height int, register *[]r
 
 	if pendingKey == 'g' && char == 'f' {
 		return viewGoToFile
+	}
+	if pendingKey == 'g' && (char == 't' || char == 'T') {
+		return map[rune]viewAction{'t': viewNextTab, 'T': viewPrevTab}[char]
 	}
 
 	switch char {

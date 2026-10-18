@@ -46,7 +46,7 @@ func newProcess() (*process, *bufCloser) {
 
 func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 	// given
-	// ... a pi session file with a user turn, a tool call, its result and a reply, under its cwd folder
+	// ... a pi session file with a user turn, a tool call, its result, a reply and an agent's report, under its cwd folder
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "--private-tmp-x--"), 0o700); err != nil {
 		t.Fatal(err)
@@ -58,6 +58,7 @@ func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 {"type":"message","id":"e3","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}}],"stopReason":"toolUse"}}
 {"type":"message","id":"e4","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"a\nb"}],"isError":false}}
 {"type":"message","id":"e5","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}
+{"type":"message","id":"e6","message":{"role":"user","content":"<agent-report session=\"local_c1\" title=\"Find callers\" status=\"completed\">\n3 callers\n</agent-report>"}}
 `
 	if err := os.WriteFile(filepath.Join(dir, "--private-tmp-x--", "2026-10-17T19-11-39-085Z_s1.jsonl"), []byte(jsonl), 0o600); err != nil {
 		t.Fatal(err)
@@ -68,9 +69,9 @@ func TestLoadTranscriptBuildsEntriesFromSessionFile(t *testing.T) {
 	es, err := Transcripts{Dir: dir}.Load("/tmp/x", "s1")
 
 	// then
-	// ... entries follow the conversation, with the tool call paired to its result
+	// ... entries follow the conversation, with the tool call paired to its result and the report as the agent's line
 	want := []core.Entry{{Kind: "user", Text: "hello"}, {Kind: "tool", Text: "bash(ls)", ID: "c1"},
-		{Kind: "result", Text: "a\nb", ID: "c1"}, {Kind: "assistant", Text: "done"}}
+		{Kind: "result", Text: "a\nb", ID: "c1"}, {Kind: "assistant", Text: "done"}, {Kind: "info", Text: `↳ agent "Find callers" completed`, ID: "local_c1"}}
 	if err != nil || !reflect.DeepEqual(es, want) {
 		t.Fatalf("err %v entries %+v", err, es)
 	}
@@ -221,11 +222,14 @@ func TestUnsupportedRequestRepliesWithAnError(t *testing.T) {
 	}
 }
 
-func TestAvailableModelsUseProviderSlashID(t *testing.T) {
+func TestAvailableModelsUseProviderSlashIDAndTheirOwnThinkingLevels(t *testing.T) {
 	// given
-	// ... pi's get_available_models data with a reasoning and a plain model
+	// ... pi's get_available_models data with a mapped reasoning model, an unmapped one, and a plain model
 	var data map[string]any
-	json.Unmarshal([]byte(`{"models":[{"id":"deepseek-v4.1-flash:cloud","name":"DeepSeek V4.1 Flash","provider":"ollama","reasoning":true},
+	json.Unmarshal([]byte(`{"models":[
+		{"id":"k3","name":"Kimi K3","provider":"kimi-coding","reasoning":true,
+		 "thinkingLevelMap":{"off":null,"minimal":null,"low":"low","medium":null,"high":"high","xhigh":null,"max":"max"}},
+		{"id":"deepseek-v4.1-flash:cloud","name":"DeepSeek V4.1 Flash","provider":"ollama","reasoning":true},
 		{"id":"MiniMax-M2.7","name":"MiniMax M2.7","provider":"minimax","reasoning":false}]}`), &data)
 
 	// when
@@ -233,8 +237,10 @@ func TestAvailableModelsUseProviderSlashID(t *testing.T) {
 	got := modelsFrom(data)
 
 	// then
-	// ... ids are provider/id, and only the reasoning model has thinking levels
-	want := []core.Model{{ID: "ollama/deepseek-v4.1-flash:cloud", Name: "DeepSeek V4.1 Flash", Description: "ollama", Efforts: thinkingLevels},
+	// ... ids are provider/id; levels follow pi's map, xhigh and max only when mapped, none without reasoning
+	want := []core.Model{
+		{ID: "kimi-coding/k3", Name: "Kimi K3", Description: "kimi-coding", Efforts: []string{"low", "high", "max"}},
+		{ID: "ollama/deepseek-v4.1-flash:cloud", Name: "DeepSeek V4.1 Flash", Description: "ollama", Efforts: []string{"off", "minimal", "low", "medium", "high"}},
 		{ID: "minimax/MiniMax-M2.7", Name: "MiniMax M2.7", Description: "minimax"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v", got)

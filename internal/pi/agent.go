@@ -77,13 +77,13 @@ func (l Launcher) pkgDir() (string, error) {
 	return "", fmt.Errorf("no package.json above %s", bin)
 }
 
-// Start runs pi through host.mjs, so the agent also gets core.Tools; their calls come back on fd 3.
-func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent, error) {
+// Start runs pi through host.mjs, so the agent also gets tools; their calls come back on fd 3.
+func (l Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core.AgentEvent) (core.Agent, error) {
 	pkg, err := l.pkgDir()
 	if err != nil {
 		return nil, fmt.Errorf("finding the pi package: %w", err)
 	}
-	tools, err := json.Marshal(core.Tools)
+	toolsJSON, err := json.Marshal(tools)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent
 	}()
 	cmd := exec.Command("node", append([]string{"--input-type=module", "-e", hostJS, "--"}, piArgs(s)...)...)
 	cmd.Dir = s.Cwd
-	cmd.Env = append(os.Environ(), "HEARTH_PI_PKG="+pkg, "HEARTH_TOOLS="+string(tools))
+	cmd.Env = append(os.Environ(), "HEARTH_PI_PKG="+pkg, "HEARTH_TOOLS="+string(toolsJSON))
 	cmd.ExtraFiles = []*os.File{theirs} // fd 3
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -155,8 +155,8 @@ func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent
 	return p, nil
 }
 
-// thinkingLevels are pi's levels; pi clamps one a model lacks to the nearest it has.
-var thinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh"}
+// thinkingLevels are pi's levels, lowest first.
+var thinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // Models asks a throwaway pi, which writes no session, for the models it has credentials for.
 func (l Launcher) Models(cwd string) ([]core.Model, error) {
@@ -203,9 +203,24 @@ func modelsFrom(data map[string]any) []core.Model {
 		m, _ := a.(map[string]any)
 		model := core.Model{ID: str(m["provider"]) + "/" + str(m["id"]), Name: str(m["name"]), Description: str(m["provider"])}
 		if m["reasoning"] == true {
-			model.Efforts = thinkingLevels
+			model.Efforts = levelsOf(m)
 		}
 		out = append(out, model)
+	}
+	return out
+}
+
+// levelsOf is a reasoning model's thinking levels, decided as pi-ai's getSupportedThinkingLevels does:
+// a level the model's thinkingLevelMap sets to null is out, and xhigh and max must be mapped to be in.
+func levelsOf(m map[string]any) []string {
+	levelMap, _ := m["thinkingLevelMap"].(map[string]any)
+	var out []string
+	for _, l := range thinkingLevels {
+		v, mapped := levelMap[l]
+		if (mapped && v == nil) || (!mapped && (l == "xhigh" || l == "max")) {
+			continue
+		}
+		out = append(out, l)
 	}
 	return out
 }

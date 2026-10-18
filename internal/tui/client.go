@@ -18,6 +18,8 @@ type Client interface {
 	Sessions() []*core.Session
 	Visible(showArchived bool) []*core.Session
 	Find(id string) *core.Session
+	Root(s *core.Session) *core.Session
+	Agents() map[string][]*core.Session
 	L(id string) *core.Live
 	Status(s *core.Session) string
 	Backend(s *core.Session) core.Caps

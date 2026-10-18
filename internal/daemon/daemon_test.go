@@ -295,3 +295,29 @@ func TestRewindPreviewAndUnqueueAnswerWhenTheAgentDoes(t *testing.T) {
 		t.Fatalf("preview %+v (%v), unqueued %q (%v), queued %+v", preview, previewErr, text, unqueueErr, c.L(s.SessionID).Queued)
 	}
 }
+
+func TestInstancesSeeAnAgentStartAndReportToItsParent(t *testing.T) {
+	// given
+	// ... an instance watching a session whose agent is running a turn
+	s := &core.Session{SessionID: "local_1", Title: "render", OriginCwd: "/p", TitleSource: "user"}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	c := h.Dial(t)
+	if err := c.Send(s, "find the callers"); err != nil {
+		t.Fatal(err)
+	}
+	parentAgent := h.Launcher.Agents[0]
+
+	// when
+	// ... the session's model starts an agent, and the agent's turn ends
+	parentAgent.Tell(s, core.CallTool("start_agent", map[string]any{"title": "Find callers", "prompt": "List callers."}, func(string, bool) {}))
+	drain(t, c, func() bool { return len(c.Sessions()) == 2 })
+	child := c.Sessions()[0]
+	h.Launcher.Agents[1].Tell(child, core.TurnEnded{OK: true})
+
+	// then
+	// ... the instance shows the agent's session, and its report queued on the parent
+	drain(t, c, func() bool {
+		q := c.L(s.SessionID).Queued
+		return len(q) == 2 && q[1].ID == child.SessionID
+	})
+}

@@ -55,7 +55,7 @@ func TestInlineMarkdownWrapsUnderItsMarker(t *testing.T) {
 	if strings.Join(got, "|") != "⏺ Title|  see go.mod |  for deps ok" {
 		t.Fatalf("rows %q", got)
 	}
-	if styles["go.mod"].Fg != th.permission || styles["deps"].Attrs != uv.AttrBold || styles["Title"].Attrs != uv.AttrBold|uv.AttrItalic {
+	if styles["go.mod"].Fg != th.accent || styles["deps"].Attrs != uv.AttrBold || styles["Title"].Attrs != uv.AttrBold|uv.AttrItalic {
 		t.Fatalf("styles %+v", styles)
 	}
 }
@@ -179,6 +179,35 @@ func TestGrepHitOpensTheSessionWithTheCursorOnTheMatch(t *testing.T) {
 	}
 	if u.focus != focusView || string(at) != "glamour" {
 		t.Fatalf("focus %d cursor %+v", u.focus, cur)
+	}
+}
+
+func TestInsertFromAScrolledUpTranscriptKeepsItScrolled(t *testing.T) {
+	// given
+	// ... a transcript taller than the pane, viewed and scrolled to its top
+	s := &core.Session{SessionID: "local_1", CLISessionID: "c1", OriginCwd: "/p"}
+	es := []core.Entry{{Kind: "user", Text: "go", UUID: "u1"}, {Kind: "assistant", Text: strings.Repeat("line\n\n", 20)}}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	h.Transcripts["c1"] = es
+	app := h.Dial(t)
+	u := &UI{app: app, collapsed: map[string]bool{}, pane: paneSession, view: 5}
+	app.EnsureLoaded(s)
+	u.slines = screenLines(u.transcript(s, app.L(s.SessionID), 60))
+	u.focusView()
+	u.viewKey(s, uv.KeyPressEvent{Code: 'g', Text: "g"})
+	u.viewKey(s, uv.KeyPressEvent{Code: 'g', Text: "g"})
+
+	// when
+	// ... i opens the prompt, then esc and k return to the transcript
+	u.viewKey(s, uv.KeyPressEvent{Code: 'i', Text: "i"})
+	insert := u.focus == focusInput && u.ed.mode == modeInsert
+	u.inputKey(s, uv.KeyPressEvent{Code: uv.KeyEscape})
+	u.inputKey(s, uv.KeyPressEvent{Code: 'k', Text: "k"})
+
+	// then
+	// ... the prompt took the keys while the scroll stayed held at the top, and the view is back on its first line
+	if !insert || !u.tv.held || u.tv.scrollTop != 0 || u.focus != focusView || u.tv.cursor.line != 0 {
+		t.Fatalf("insert %v held %v scroll %d focus %d cursor %+v", insert, u.tv.held, u.tv.scrollTop, u.focus, u.tv.cursor)
 	}
 }
 

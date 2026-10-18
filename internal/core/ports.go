@@ -51,7 +51,8 @@ const DefaultBackend = "claude"
 
 // Launcher starts an agent for s; the agent reports on out until it sends Exited.
 type Launcher interface {
-	Start(s *Session, out chan<- AgentEvent) (Agent, error)
+	// tools are this launch's Tools, as App.tools builds them.
+	Start(s *Session, tools []map[string]any, out chan<- AgentEvent) (Agent, error)
 	// Models lists the models an agent started in cwd offers. It blocks while it asks one.
 	Models(cwd string) ([]Model, error)
 }
@@ -114,6 +115,12 @@ type (
 		TaskID string
 		Reply  func(text string, isErr bool)
 	}
+	// AgentRequested must be answered once through Reply.
+	AgentRequested struct {
+		Title, Prompt          string
+		Backend, Model, Effort string // optional; see agentSetup
+		Reply                  func(text string, isErr bool)
+	}
 	// Reply answers the request with RequestID; only the fields for that request are set.
 	Reply struct {
 		RequestID string
@@ -123,7 +130,7 @@ type (
 		Rewind    RewindPreview
 	}
 	Exited struct{ Err error }
-	// ModelsListed carries a backend's model list, fetched for the session that asked.
+	// ModelsListed carries a backend's model list.
 	ModelsListed struct {
 		Backend string
 		Models  []Model
@@ -142,6 +149,7 @@ func (PermissionRequested) event() {}
 func (PermissionCancelled) event() {}
 func (TaskSuggested) event()       {}
 func (TaskDismissed) event()       {}
+func (AgentRequested) event()      {}
 func (Reply) event()               {}
 func (Exited) event()              {}
 func (ModelsListed) event()        {}

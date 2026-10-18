@@ -55,13 +55,15 @@ func (w *Worktrees) Remove(originCwd, path string) error { return w.RemoveErr }
 type Launcher struct {
 	Agents []*Agent
 	Offers []core.Model
-	Lists  int // Models calls
+	Lists  int              // Models calls
+	Tools  []map[string]any // the tools the latest Start was given
 }
 
 func (l *Launcher) Models(cwd string) ([]core.Model, error) { l.Lists++; return l.Offers, nil }
 
-func (l *Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent, error) {
+func (l *Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core.AgentEvent) (core.Agent, error) {
 	ag := &Agent{out: out, Asked: make(chan struct{}, 16)}
+	l.Tools = tools
 	l.Agents = append(l.Agents, ag)
 	return ag, nil
 }

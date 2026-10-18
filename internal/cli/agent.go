@@ -33,9 +33,10 @@ type Launcher struct{ Binary string }
 // process is one CLI process. It translates the wire protocol to core events
 // and back; all session state lives in core.App.
 type process struct {
-	mu  sync.Mutex
-	w   io.WriteCloser
-	cmd *exec.Cmd
+	mu    sync.Mutex
+	w     io.WriteCloser
+	cmd   *exec.Cmd
+	tools []map[string]any // what the hearth MCP server lists
 }
 
 func cliArgs(s *core.Session) []string {
@@ -49,7 +50,8 @@ func cliArgs(s *core.Session) []string {
 	for _, t := range core.Tools {
 		allowed = append(allowed, "mcp__"+mcpServerName+"__"+t["name"].(string))
 	}
-	args = append(args, "--allowedTools", strings.Join(allowed, ","))
+	// The built-in Agent tool is off: subagents are hearth sessions started with start_agent.
+	args = append(args, "--allowedTools", strings.Join(allowed, ","), "--disallowedTools", "Agent")
 	if s.Model != "" {
 		args = append(args, "--model", s.Model)
 	}
@@ -62,7 +64,7 @@ func cliArgs(s *core.Session) []string {
 	return args
 }
 
-func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent, error) {
+func (l Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core.AgentEvent) (core.Agent, error) {
 	cmd := exec.Command(l.Binary, cliArgs(s)...)
 	cmd.Dir = s.Cwd
 	cmd.Env = append(os.Environ(), "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true")
@@ -77,7 +79,7 @@ func (l Launcher) Start(s *core.Session, out chan<- core.AgentEvent) (core.Agent
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	p := &process{w: stdin, cmd: cmd}
+	p := &process{w: stdin, cmd: cmd, tools: tools}
 	p.request(map[string]any{"subtype": "initialize", "sdkMcpServers": []string{mcpServerName}})
 	go func() {
 		r := bufio.NewReaderSize(stdout, 1<<20)
@@ -244,7 +246,7 @@ func (p *process) mcp(reqID string, m map[string]any) core.Event {
 			"serverInfo": map[string]any{"name": mcpServerName, "version": "0.1.0"}})
 		return nil
 	case "tools/list":
-		ok(map[string]any{"tools": core.Tools})
+		ok(map[string]any{"tools": p.tools})
 		return nil
 	case "tools/call":
 		args, _ := params["arguments"].(map[string]any)

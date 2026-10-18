@@ -34,12 +34,16 @@ type Live struct {
 	pending      map[string]func(Reply)
 	asked        string // id of the request PreviewRewind or Unqueue last put to the agent
 	wantWorktree bool
+	owesParent   bool   // an agent whose current turn its parent awaits a report on
+	Report       string // how an agent's last reported turn ended: completed, failed or stopped
+	Retryable    bool   // that turn failed for a temporary reason after doing some work
 }
 
 type App struct {
 	store     SessionStore
 	backends  map[string]Backend
 	models    map[string][]Model // by backend, once listed
+	modelErrs map[string]error   // by backend: why its listing failed
 	worktrees Worktrees
 	sessions  []*Session
 	live      map[string]*Live
@@ -65,7 +69,7 @@ func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees
 			return nil, fmt.Errorf("session %s uses unknown backend %q", s.SessionID, s.Backend)
 		}
 	}
-	return &App{store: store, backends: backends, models: map[string][]Model{}, worktrees: worktrees, sessions: ss,
+	return &App{store: store, backends: backends, models: map[string][]Model{}, modelErrs: map[string]error{}, worktrees: worktrees, sessions: ss,
 		live: map[string]*Live{}, events: make(chan AgentEvent, 256), now: func() int64 { return time.Now().UnixMilli() }}, nil
 }
 
@@ -93,13 +97,26 @@ func (a *App) Models(s *Session) (models []Model, loading bool) {
 	if ok {
 		return ms, ms == nil
 	}
-	a.models[s.Backend] = nil // listing
-	b, launcher := s.Backend, a.Backend(s).Launcher
-	go func() {
-		ms, err := launcher.Models(s.Cwd)
-		a.events <- AgentEvent{SessionID: s.SessionID, Event: ModelsListed{Backend: b, Models: ms, Err: err}}
-	}()
+	a.list(s.Backend, s.Cwd)
 	return nil, true
+}
+
+// ListModels lists every backend's models in the background, so start_agent can offer them.
+func (a *App) ListModels(cwd string) {
+	for b := range a.backends {
+		if _, ok := a.models[b]; !ok {
+			a.list(b, cwd)
+		}
+	}
+}
+
+func (a *App) list(b, cwd string) {
+	a.models[b] = nil // listing
+	launcher := a.backends[b].Launcher
+	go func() {
+		ms, err := launcher.Models(cwd)
+		a.events <- AgentEvent{Event: ModelsListed{Backend: b, Models: ms, Err: err}}
+	}()
 }
 
 // Efforts lists the effort levels s's model accepts, or nil when its model isn't listed.
@@ -165,14 +182,14 @@ func (a *App) save(s *Session) {
 
 func (a *App) IsRepo(dir string) bool { return a.worktrees.IsRepo(dir) }
 
-// Visible lists sessions for the sidebar: starred first, then most recent.
+// Visible lists sessions for the sidebar, leaving out agents shown under their root: starred first, then most recent.
 func (a *App) Visible(showArchived bool) []*Session { return Visible(a.sessions, showArchived) }
 
-// Visible lists ss for the sidebar: starred first, then most recent.
+// Visible lists ss for the sidebar, leaving out agents shown under their root: starred first, then most recent.
 func Visible(ss []*Session, showArchived bool) []*Session {
 	var out []*Session
 	for _, s := range ss {
-		if s.IsArchived == showArchived {
+		if s.IsArchived == showArchived && Root(ss, s) == s {
 			out = append(out, s)
 		}
 	}
@@ -257,7 +274,7 @@ func (a *App) EnsureAgent(s *Session) (Agent, error) {
 	if l.agent != nil {
 		return l.agent, nil
 	}
-	ag, err := a.Backend(s).Launcher.Start(s, a.events)
+	ag, err := a.Backend(s).Launcher.Start(s, a.tools(), a.events)
 	if err != nil {
 		return nil, err
 	}
@@ -266,6 +283,11 @@ func (a *App) EnsureAgent(s *Session) (Agent, error) {
 }
 
 func (a *App) Send(s *Session, text string) error {
+	return a.send(s, text, Entry{Kind: "user", Text: text})
+}
+
+// send sends text to s's agent; shown is what the transcript shows once the agent reads it.
+func (a *App) send(s *Session, text string, shown Entry) error {
 	l := a.L(s.SessionID)
 	if l.wantWorktree {
 		wt, err := a.worktrees.Create(s.OriginCwd, text)
@@ -286,7 +308,8 @@ func (a *App) Send(s *Session, text string) error {
 	if err := ag.SendUser(text, id); err != nil {
 		return err
 	}
-	l.Queued = append(l.Queued, Entry{Kind: "user", Text: text, UUID: id})
+	shown.UUID = id
+	l.Queued = append(l.Queued, shown)
 	startTurn(l)
 	s.LastActivityAt = a.now()
 	a.save(s)
@@ -317,6 +340,9 @@ func (a *App) Unqueue(s *Session, done func(string)) error {
 		return fmt.Errorf("nothing queued")
 	}
 	e := l.Queued[len(l.Queued)-1]
+	if e.Kind != "user" {
+		return fmt.Errorf("the newest queued message is an agent's report, not yours")
+	}
 	l.asked = l.agent.CancelQueued(e.UUID)
 	l.pending[l.asked] = func(r Reply) {
 		if !r.Cancelled {
@@ -540,6 +566,7 @@ func (a *App) Handle(m AgentEvent) {
 		if e.Err != nil {
 			a.Notice = "listing models: " + e.Err.Error()
 		}
+		a.modelErrs[e.Backend] = e.Err
 		// shortcut: a failed listing caches as empty until restart, rather than retrying on every redraw.
 		a.models[e.Backend] = append([]Model{}, e.Models...)
 		return
@@ -560,6 +587,9 @@ func (a *App) Handle(m AgentEvent) {
 		if l.Running {
 			l.Running, l.Errored = false, true
 			l.Entries = append(l.Entries, Entry{Kind: "error", Text: fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err)})
+		}
+		if l.owesParent {
+			a.report(s, l, "failed", fmt.Sprintf("%s exited: %v", a.Backend(s).Label, e.Err))
 		}
 	case Initialized:
 		l.Version, l.Model = e.Version, e.Model
@@ -599,6 +629,18 @@ func (a *App) Handle(m AgentEvent) {
 		default:
 			l.Entries = append(l.Entries, Entry{Kind: "error", Text: e.Failure})
 		}
+		if l.owesParent {
+			switch {
+			case interrupted && !e.OK:
+				a.report(s, l, "stopped", "The user stopped the agent. Its last message:\n\n"+finalMessage(l))
+			case e.OK:
+				a.report(s, l, "completed", finalMessage(l))
+			default:
+				retry := temporaryFailure.MatchString(e.Failure) && finalMessage(l) != noFinalMessage
+				a.report(s, l, "failed", e.Failure+"\n\n"+finalMessage(l))
+				l.Retryable = retry
+			}
+		}
 		if s.TitleSource == "auto" && s.CompletedTurns == 1 {
 			a.requestTitle(s, l)
 		}
@@ -636,6 +678,8 @@ func (a *App) Handle(m AgentEvent) {
 			}
 		}
 		e.Reply("That task was already started or dismissed; do not retry.", false)
+	case AgentRequested:
+		a.startAgent(s, e)
 	case Reply:
 		cb, ok := l.pending[e.RequestID]
 		if !ok {

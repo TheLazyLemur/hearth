@@ -36,6 +36,7 @@ type SpawnedFrom struct {
 	SessionID string `json:"sessionId"`
 	TaskID    string `json:"taskId"`
 	Title     string `json:"title"`
+	Kind      string `json:"kind,omitempty"` // "agent": started by the parent's model with start_agent; "": an accepted task chip
 }
 
 // Entry is one rendered transcript item, built from either the JSONL file or the live stream.

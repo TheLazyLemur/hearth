@@ -170,7 +170,7 @@ func (c *Client) applyChange(ch *change) {
 	if i := slices.IndexFunc(c.ss, func(o *core.Session) bool { return o.SessionID == s.SessionID }); i >= 0 {
 		c.ss[i] = s
 	} else {
-		c.ss = append(c.ss, s)
+		c.ss = append([]*core.Session{s}, c.ss...) // newest first, as the daemon keeps them
 	}
 	if l == nil {
 		return
@@ -278,6 +278,12 @@ func (c *Client) Find(id string) *core.Session {
 	}
 	return c.ss[i]
 }
+
+// Root is the session the user started that s works under: s itself unless s is an agent.
+func (c *Client) Root(s *core.Session) *core.Session { return core.Root(c.ss, s) }
+
+// Agents lists the agents under each root at any depth, oldest first, by the root's session ID.
+func (c *Client) Agents() map[string][]*core.Session { return core.Agents(c.ss) }
 
 // L lists the live data of a session; a session the daemon doesn't know is idle and empty.
 func (c *Client) L(id string) *core.Live {

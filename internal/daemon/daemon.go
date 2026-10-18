@@ -313,13 +313,22 @@ func (d *Daemon) snapshot(p *peer) snapshot {
 
 // event applies one agent report and tells clients what it changed.
 func (d *Daemon) event(m core.AgentEvent) {
+	before := len(d.app.Sessions())
 	d.app.Handle(m)
 	d.failWaits(m)
 	if e, ok := m.Event.(core.ModelsListed); ok {
 		d.send(msg{Change: &change{Models: &models{Backend: e.Backend, Items: e.Models}}})
 	}
-	if m.SessionID != "" {
-		d.changed(m.SessionID)
+	// start_agent puts the sessions it starts first, and an agent's report lands on its parent
+	ss := d.app.Sessions()
+	for _, s := range ss[:max(0, len(ss)-before)] {
+		d.changed(s.SessionID)
+	}
+	if s := d.app.Find(m.SessionID); s != nil {
+		d.changed(s.SessionID)
+		if s.SpawnedFrom != nil {
+			d.changed(s.SpawnedFrom.SessionID)
+		}
 	}
 	d.daemonNotice()
 }

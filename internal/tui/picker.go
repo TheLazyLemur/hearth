@@ -295,13 +295,15 @@ func (u *UI) drawPicker(W, H int) {
 	w, h := min(W-4, 140), min(H-2, 32)
 	x0, y0 := (W-w)/2, (H-h)/2
 	lw := w * 2 / 5
-	title := " Sessions "
+	u.ambient = th.panel
+	defer func() { u.ambient = nil }()
+	title := "sessions"
 	if p.grep {
-		title = " Grep "
+		title = "grep"
 	}
 	u.box(x0, y0, lw, h, title)
-	u.box(x0+lw, y0, w-lw, h, " Preview ")
-	u.drawLine(x0+2, y0+1, lw-4, ln(span{"> ", fg(th.permission)}, span{string(p.query), uv.Style{}}))
+	u.box(x0+lw, y0, w-lw, h, "")
+	u.drawLine(x0+2, y0+1, lw-4, ln(span{"> ", fg(th.accent)}, span{string(p.query), uv.Style{}}))
 	rows := h - 5 // query, gap, the list, count
 	top := max(0, p.sel-rows+1)
 	for i := 0; i < rows && top+i < len(p.items); i++ {
@@ -327,19 +329,12 @@ func (u *UI) drawPicker(W, H int) {
 	u.scr.ShowCursor()
 }
 
-// box clears a w×h rectangle and draws a rounded border with title in its top edge.
+// box clears a w×h rectangle to the ambient panel colour, title in its bottom-right corner.
 func (u *UI) box(x, y, w, h int, title string) {
-	b := fg(th.inactive)
 	for r := 0; r < h; r++ {
 		u.put(x, y+r, w, strings.Repeat(" ", w), uv.Style{})
 	}
-	u.put(x, y, w, "╭"+strings.Repeat("─", w-2)+"╮", b)
-	for r := 1; r < h-1; r++ {
-		u.put(x, y+r, 1, "│", b)
-		u.put(x+w-1, y+r, 1, "│", b)
-	}
-	u.put(x, y+h-1, w, "╰"+strings.Repeat("─", w-2)+"╯", b)
-	u.put(x+2, y, ansi.StringWidth(title), title, uv.Style{Fg: th.claude, Attrs: uv.AttrBold})
+	u.put(x+w-2-ansi.StringWidth(title), y+h-1, ansi.StringWidth(title), title, fg(th.subtle))
 }
 
 func (u *UI) pickRow(it pickItem, sel bool) line {
@@ -347,7 +342,7 @@ func (u *UI) pickRow(it pickItem, sel bool) line {
 	if sel {
 		caret, base = "❯ ", uv.Style{Attrs: uv.AttrBold}
 	}
-	sp := []span{{caret, fg(th.permission)}}
+	sp := []span{{caret, fg(th.accent)}}
 	var tag span
 	if u.pick.grep {
 		t := ansi.Truncate(cmp.Or(it.s.Title, "New session"), 18, "…")
@@ -363,7 +358,7 @@ func (u *UI) pickRow(it pickItem, sel bool) line {
 			st = fg(th.inactive)
 		}
 		if slices.Contains(it.hits, i) {
-			st = uv.Style{Fg: th.claude, Attrs: uv.AttrBold}
+			st = uv.Style{Fg: th.accent, Attrs: uv.AttrBold}
 		}
 		if n := len(sp); sp[n-1].st.Equal(&st) {
 			sp[n-1].t += string(r)
@@ -398,9 +393,9 @@ func (u *UI) drawPreview(it pickItem, x, y, w, h int) {
 func (u *UI) statusGlyph(s *core.Session) (string, uv.Style) {
 	switch u.app.Status(s) {
 	case "running":
-		return spinnerFrame(u.app.L(s.SessionID).Started), fg(th.claude)
+		return ember(u.app.L(s.SessionID).Started)
 	case "waiting":
-		return "?", fg(th.permission)
+		return "?", fg(th.accent)
 	case "error":
 		return "✗", fg(th.error)
 	}
