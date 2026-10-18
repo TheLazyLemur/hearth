@@ -400,6 +400,11 @@ func (u *UI) inputKey(s *core.Session, k uv.KeyPressEvent) {
 func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 	char, key := translateKey(k)
 	tv := &u.tv
+	defer func() {
+		if u.focus == focusInput { // left for the prompt: hold the scroll unless it was at the newest output
+			tv.held = tv.scrollTop < len(u.slines)-u.view
+		}
+	}()
 	if !tv.search.typing && tv.visual == visualOff && tv.pendingKey == 0 && !tv.pendingWindowCmd {
 		op := u.op
 		u.op = ""
@@ -455,7 +460,9 @@ func (u *UI) viewKey(s *core.Session, k uv.KeyPressEvent) {
 
 func (u *UI) focusView() {
 	u.focus = focusView
-	u.tv.focusLastLine(u.slines, u.view)
+	if !u.tv.held { // a held transcript keeps its cursor where the view left it
+		u.tv.focusLastLine(u.slines, u.view)
+	}
 }
 
 // submit sends the prompt (queued by the CLI if a turn is running), or answers a question.
@@ -479,6 +486,7 @@ func (u *UI) submit(s *core.Session, interrupt bool) {
 		return
 	}
 	u.ed.reset()
+	u.tv.held = false
 }
 
 // pickModel offers s's backend models; typing filters them, a number or enter picks, unlisted text is taken as an id.
@@ -1044,6 +1052,8 @@ func (u *UI) draw() {
 		viewing := u.pane == paneSession && u.focus == focusView
 		if viewing {
 			u.tv.clampAndScroll(u.slines, u.view)
+		} else if u.tv.held {
+			u.tv.scrollTop = min(u.tv.scrollTop, max(0, len(lines)-u.view))
 		} else {
 			u.tv.scrollTop = max(0, len(lines)-u.view) // follow the newest output
 		}

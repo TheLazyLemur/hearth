@@ -52,6 +52,7 @@ type transcriptView struct {
 	cursor           position
 	stickyCol        int
 	scrollTop        int
+	held             bool // left scrolled up: the prompt doesn't snap it to the newest output
 	pendingKey       rune
 	pendingWindowCmd bool
 
