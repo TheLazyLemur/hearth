@@ -4,10 +4,42 @@ hearth is a harness on top of coding agents, not a control panel over their term
 each agent through a structured protocol, owns sessions, worktrees, permissions, tools and
 orchestration itself, and treats a backend as little more than a model loop.
 
-Order: **nested sessions → daemon → more backends**. Everything new lives in `core.App` as plain
-data, never in `tui`, so it moves behind the daemon's socket unchanged.
+Order: **daemon → nested sessions → more backends**. Everything new lives in `core.App` as plain
+data, never in `tui`, so it reaches instances through the daemon's socket unchanged.
 
-## 1. Nested sessions
+## 1. Daemon (built)
+
+`App`, the agent adapters and later our own tools run in a background process that owns the agent
+processes and the store, listening on a Unix socket. The TUI is a client: snapshot, then a stream of
+changes. One binary: `hearth daemon`; plain `hearth` starts it if needed, then connects. The spec is
+`docs/specs/daemon.md`.
+
+Requirements:
+
+- Running turns and, later, nested children and parent wakes survive `:q` and the laptop lid.
+- Every open hearth instance sees the same live state.
+- SSH via the same protocol over a forwarded socket.
+- Opening hearth in any terminal stays the natural way in. Sessions are shared; view state is per
+  client: focus, selection, collapsed groups, scroll, visual mode, and the launch folder. A client
+  launched in a folder focuses that project's group and selects its latest session; if the project
+  has no sessions, it shows the group with "new session here" instead of an empty list.
+
+Still open after the first slice: SSH over a forwarded socket, notifications while nobody is
+attached, reconnecting a client, and per-session subscriptions.
+
+Decisions made:
+
+1. Lifecycle: exit when no client is attached and nothing runs — no turn, permission or queued
+   message — after about 30 seconds.
+2. Nobody attached: permission requests wait for the next client. No notifications.
+3. Several clients answer the same permission: the first answer wins, later ones get "already
+   answered", and every instance's dialog closes.
+4. Upgrades: a new binary replaces an idle daemon of another protocol version and refuses a busy one
+   with "daemon vX is running turns; finish or `hearth daemon stop`".
+5. State format: split into plain data and live handles. `Live` carries what clients hold; the agent
+   handle and reply callbacks stay in the daemon.
+
+## 2. Nested sessions
 
 Parity with Claude Desktop's nested ("side") sessions: a session starts other sessions, they report
 back, and the parent is woken when they finish. Desktop does this entirely host-side (in-process MCP
@@ -52,7 +84,6 @@ tools, appended prompt text, injected messages); the CLI has no feature for it.
 ### TUI
 
 - Children nested under their parent in the sidebar, with state.
-- `:q` warns while children are running (until the daemon makes that safe).
 
 ### Later variants on the same core
 
@@ -62,7 +93,7 @@ tools, appended prompt text, injected messages); the CLI has no feature for it.
 - `detach_session`, `stop_session`, `archive_session`.
 - Placement (`cwd`, SSH host, presets, cloud) only once hearth has those features underneath.
 
-## 2. Harness seams
+## 3. Harness seams
 
 - System-prompt hook, built by core per session and delivered by each adapter: Claude
   `--append-system-prompt` on every launch including resume; pi through `host.mjs`
@@ -73,34 +104,6 @@ tools, appended prompt text, injected messages); the CLI has no feature for it.
 - Tool calls already know their caller: `CallTool` returns an event and `Handle` routes it by
   `AgentEvent.SessionID`. New tools follow the `TaskSuggested` pattern.
 
-## 3. Daemon
-
-`App`, the agent adapters and later our own tools run in a background process that owns the agent
-processes and the store, listening on a Unix socket. The TUI becomes a client: snapshot, then a
-stream of changes. One binary: `hearth daemon`; plain `hearth` starts it if needed, then connects.
-
-Requirements:
-
-- Running turns, nested children and parent wakes survive `:q` and the laptop lid.
-- Every open hearth instance sees the same live state.
-- SSH via the same protocol over a forwarded socket.
-- Opening hearth in any terminal stays the natural way in. Sessions are shared; view state is per
-  client: focus, selection, collapsed groups, scroll, visual mode, and the launch folder. A client
-  launched in a folder focuses that project's group and selects its latest session; if the project
-  has no sessions, it shows the group with "new session here" instead of an empty list.
-
-Decide before building:
-
-1. Lifecycle: run forever, or exit when no client is attached and nothing runs?
-2. Nobody attached: permission requests wait, notify, or follow a per-session rule?
-3. Several clients answer the same permission: which wins?
-4. Upgrades: a new binary meets an old daemon mid-turn. Default: refuse and say why.
-5. State format: split session state into plain data and live handles (the bulk of the refactor).
-
-Until then, several instances are unsafe: session JSON is last-writer-wins and two instances can
-resume the same CLI session. Possible stopgap: a per-session `flock` in `~/.hearth/sessions`, with
-other instances showing the session read-only.
-
 ## 4. Backends
 
 Contract every backend must meet:
@@ -108,7 +111,7 @@ Contract every backend must meet:
 - start, resume, interrupt; messages sent mid-turn are queued;
 - structured events: turn start and end, assistant text, tool calls and results, errors;
 - serves `core.Tools`, and gates every tool that isn't ours through hearth's permission flow;
-- accepts appended system-prompt text (see §2).
+- accepts appended system-prompt text (see §3).
 
 Optional, advertised as capabilities: fork, rewind, unqueue, native permission modes, model and
 effort listing. Keep these as bools until a third backend shows the right shape.
