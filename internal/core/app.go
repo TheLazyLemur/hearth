@@ -40,6 +40,7 @@ type App struct {
 	store     SessionStore
 	backends  map[string]Backend
 	models    map[string][]Model // by backend, once listed
+	modelErrs map[string]error   // by backend: why its listing failed
 	worktrees Worktrees
 	sessions  []*Session
 	live      map[string]*Live
@@ -65,7 +66,7 @@ func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees
 			return nil, fmt.Errorf("session %s uses unknown backend %q", s.SessionID, s.Backend)
 		}
 	}
-	return &App{store: store, backends: backends, models: map[string][]Model{}, worktrees: worktrees, sessions: ss,
+	return &App{store: store, backends: backends, models: map[string][]Model{}, modelErrs: map[string]error{}, worktrees: worktrees, sessions: ss,
 		live: map[string]*Live{}, events: make(chan AgentEvent, 256), now: func() int64 { return time.Now().UnixMilli() }}, nil
 }
 
@@ -93,13 +94,26 @@ func (a *App) Models(s *Session) (models []Model, loading bool) {
 	if ok {
 		return ms, ms == nil
 	}
-	a.models[s.Backend] = nil // listing
-	b, launcher := s.Backend, a.Backend(s).Launcher
-	go func() {
-		ms, err := launcher.Models(s.Cwd)
-		a.events <- AgentEvent{SessionID: s.SessionID, Event: ModelsListed{Backend: b, Models: ms, Err: err}}
-	}()
+	a.list(s.Backend, s.Cwd)
 	return nil, true
+}
+
+// ListModels lists every backend's models in the background, so start_agent can offer them.
+func (a *App) ListModels(cwd string) {
+	for b := range a.backends {
+		if _, ok := a.models[b]; !ok {
+			a.list(b, cwd)
+		}
+	}
+}
+
+func (a *App) list(b, cwd string) {
+	a.models[b] = nil // listing
+	launcher := a.backends[b].Launcher
+	go func() {
+		ms, err := launcher.Models(cwd)
+		a.events <- AgentEvent{Event: ModelsListed{Backend: b, Models: ms, Err: err}}
+	}()
 }
 
 // Efforts lists the effort levels s's model accepts, or nil when its model isn't listed.
@@ -232,7 +246,7 @@ func (a *App) ensureAgent(s *Session) (Agent, error) {
 	if l.agent != nil {
 		return l.agent, nil
 	}
-	ag, err := a.Backend(s).Launcher.Start(s, a.events)
+	ag, err := a.Backend(s).Launcher.Start(s, a.tools(), a.events)
 	if err != nil {
 		return nil, err
 	}
@@ -517,6 +531,7 @@ func (a *App) Handle(m AgentEvent) {
 		if e.Err != nil {
 			a.Notice = "listing models: " + e.Err.Error()
 		}
+		a.modelErrs[e.Backend] = e.Err
 		// shortcut: a failed listing caches as empty until restart, rather than retrying on every redraw.
 		a.models[e.Backend] = append([]Model{}, e.Models...)
 		return

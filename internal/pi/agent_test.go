@@ -221,11 +221,14 @@ func TestUnsupportedRequestRepliesWithAnError(t *testing.T) {
 	}
 }
 
-func TestAvailableModelsUseProviderSlashID(t *testing.T) {
+func TestAvailableModelsUseProviderSlashIDAndTheirOwnThinkingLevels(t *testing.T) {
 	// given
-	// ... pi's get_available_models data with a reasoning and a plain model
+	// ... pi's get_available_models data with a mapped reasoning model, an unmapped one, and a plain model
 	var data map[string]any
-	json.Unmarshal([]byte(`{"models":[{"id":"deepseek-v4.1-flash:cloud","name":"DeepSeek V4.1 Flash","provider":"ollama","reasoning":true},
+	json.Unmarshal([]byte(`{"models":[
+		{"id":"k3","name":"Kimi K3","provider":"kimi-coding","reasoning":true,
+		 "thinkingLevelMap":{"off":null,"minimal":null,"low":"low","medium":null,"high":"high","xhigh":null,"max":"max"}},
+		{"id":"deepseek-v4.1-flash:cloud","name":"DeepSeek V4.1 Flash","provider":"ollama","reasoning":true},
 		{"id":"MiniMax-M2.7","name":"MiniMax M2.7","provider":"minimax","reasoning":false}]}`), &data)
 
 	// when
@@ -233,8 +236,10 @@ func TestAvailableModelsUseProviderSlashID(t *testing.T) {
 	got := modelsFrom(data)
 
 	// then
-	// ... ids are provider/id, and only the reasoning model has thinking levels
-	want := []core.Model{{ID: "ollama/deepseek-v4.1-flash:cloud", Name: "DeepSeek V4.1 Flash", Description: "ollama", Efforts: thinkingLevels},
+	// ... ids are provider/id; levels follow pi's map, xhigh and max only when mapped, none without reasoning
+	want := []core.Model{
+		{ID: "kimi-coding/k3", Name: "Kimi K3", Description: "kimi-coding", Efforts: []string{"low", "high", "max"}},
+		{ID: "ollama/deepseek-v4.1-flash:cloud", Name: "DeepSeek V4.1 Flash", Description: "ollama", Efforts: []string{"off", "minimal", "low", "medium", "high"}},
 		{ID: "minimax/MiniMax-M2.7", Name: "MiniMax M2.7", Description: "minimax"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v", got)
