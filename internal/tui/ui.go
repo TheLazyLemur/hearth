@@ -1022,9 +1022,11 @@ func (u *UI) draw() {
 	scr.SetCursorStyle(shape, false)
 	if s == nil {
 		msg := "no sessions · o to start one, or :e <folder>"
-		cy := top / 2
-		u.put(x+(w-4)/2, cy-1, 4, " 炉 ", uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold})
-		u.put(x+(w-ansi.StringWidth(msg))/2, cy+1, w, msg, fg(th.inactive))
+		cy := top/2 - 2
+		for i, row := range seal {
+			u.put(x+(w-sealW)/2, cy+i, sealW, row.t, row.st)
+		}
+		u.put(x+(w-ansi.StringWidth(msg))/2, cy+len(seal)+1, w, msg, fg(th.inactive))
 	} else {
 		lines := u.transcript(s, l, w)
 		old := u.slines
@@ -1196,12 +1198,21 @@ func (u *UI) header(s *core.Session, l *core.Live) []line {
 		ver = " " + l.Version
 	}
 	model := cmp.Or(s.Model, l.Model, "default model")
+	gap := span{"   ", uv.Style{}}
 	return []line{
-		ln(span{" 炉 ", uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold}}, span{"   ", uv.Style{}},
-			span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)},
-			span{" · " + model + " · " + shortPath(s.Cwd) + branchSuffix(s), dim}),
+		ln(seal[0], gap, span{u.app.Backend(s).Label, fg(th.text)}, span{ver, fg(th.subtle)}),
+		ln(seal[1], gap, span{model, dim}),
+		ln(seal[2], gap, span{shortPath(s.Cwd) + branchSuffix(s), dim}),
 	}
 }
+
+// seal is the hearth logo: 炉 (ro, hearth) on a vermilion block, about square since cells are twice as tall as wide.
+var seal = func() []span {
+	st := uv.Style{Fg: th.text, Bg: th.accent, Attrs: uv.AttrBold}
+	return []span{{"      ", st}, {"  炉  ", st}, {"      ", st}}
+}()
+
+const sealW = 6
 
 func (u *UI) transcript(s *core.Session, l *core.Live, w int) []line {
 	lines := u.header(s, l)
