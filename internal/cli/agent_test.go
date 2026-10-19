@@ -152,6 +152,32 @@ func TestSpawnTaskCallBecomesSuggestionAnsweredOverMCP(t *testing.T) {
 	}
 }
 
+func TestToolsListMarksEveryToolAlwaysLoaded(t *testing.T) {
+	// given
+	// ... a process serving hearth's tools
+	w := &bufCloser{}
+	p := &process{w: w, tools: core.Tools}
+
+	// when
+	// ... the CLI lists the hearth MCP server's tools
+	decodeLine(t, p, `{"type":"control_request","request_id":"m1","request":{"subtype":"mcp_message","server_name":"hearth",
+		"message":{"jsonrpc":"2.0","id":1,"method":"tools/list"}}}`)
+
+	// then
+	// ... every tool asks Claude Code never to defer it behind tool search
+	mcp := lastJSON(t, w)["response"].(map[string]any)["response"].(map[string]any)["mcp_response"].(map[string]any)
+	tools := mcp["result"].(map[string]any)["tools"].([]any)
+	var loaded int
+	for _, tool := range tools {
+		if meta, _ := tool.(map[string]any)["_meta"].(map[string]any); meta["anthropic/alwaysLoad"] == true {
+			loaded++
+		}
+	}
+	if len(tools) != len(core.Tools) || loaded != len(tools) {
+		t.Fatalf("tools %+v", tools)
+	}
+}
+
 func TestInitializeReplyListsModels(t *testing.T) {
 	// given
 	// ... the CLI's initialize reply with two models
