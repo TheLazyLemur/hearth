@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"strings"
@@ -246,7 +247,13 @@ func (p *process) mcp(reqID string, m map[string]any) core.Event {
 			"serverInfo": map[string]any{"name": mcpServerName, "version": "0.1.0"}})
 		return nil
 	case "tools/list":
-		ok(map[string]any{"tools": p.tools})
+		tools := make([]map[string]any, len(p.tools))
+		for i, t := range p.tools {
+			// Claude Code's tool search would otherwise defer them, hiding them until the model searches.
+			tools[i] = maps.Clone(t)
+			tools[i]["_meta"] = map[string]any{"anthropic/alwaysLoad": true}
+		}
+		ok(map[string]any{"tools": tools})
 		return nil
 	case "tools/call":
 		args, _ := params["arguments"].(map[string]any)
