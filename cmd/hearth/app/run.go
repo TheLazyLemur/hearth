@@ -13,6 +13,7 @@ import (
 	"hearth/internal/daemon"
 	"hearth/internal/git"
 	"hearth/internal/pi"
+	"hearth/internal/shell"
 	"hearth/internal/store"
 	"hearth/internal/tui"
 )
@@ -121,7 +122,7 @@ func newApp(dir, home string) (*core.App, error) {
 			Launcher: pi.Launcher{Binary: "pi"},
 			Transcripts: pi.Transcripts{Dir: cmp.Or(os.Getenv("PI_CODING_AGENT_SESSION_DIR"),
 				filepath.Join(cmp.Or(os.Getenv("PI_CODING_AGENT_DIR"), filepath.Join(home, ".pi", "agent")), "sessions"))}},
-	}, git.Worktrees{})
+	}, git.Worktrees{}, shell.Shells{})
 	if err != nil {
 		return nil, fmt.Errorf("load sessions: %w", err)
 	}

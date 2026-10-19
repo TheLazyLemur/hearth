@@ -109,7 +109,7 @@ func TestInstanceThatStopsReadingIsDroppedNotTheDaemon(t *testing.T) {
 	s := &core.Session{SessionID: "local_1", Title: "render", OriginCwd: "/p", TitleSource: "user"}
 	h := testfakes.NewHarness(t, time.Hour, s)
 	stuck := h.Conn(t)
-	if _, err := fmt.Fprint(stuck, `{"hello":{"version":"1"}}`+"\n"); err != nil {
+	if _, err := fmt.Fprint(stuck, `{"hello":{"version":"`+daemon.Version+`"}}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -320,4 +320,73 @@ func TestInstancesSeeAnAgentStartAndReportToItsParent(t *testing.T) {
 		q := c.L(s.SessionID).Queued
 		return len(q) == 2 && q[1].ID == child.SessionID
 	})
+}
+
+func TestShellTypedIntoInOneInstanceShowsInEveryOneUntilItExits(t *testing.T) {
+	// given
+	// ... two instances, one of which opens the session's shell
+	s := &core.Session{SessionID: "local_1", Title: "render", Cwd: "/p/wt", OriginCwd: "/p", TitleSource: "user"}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	a, b := h.Dial(t), h.Dial(t)
+	if err := a.OpenShell(s, 80, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	// when
+	// ... it types into the shell
+	for _, r := range "ls" {
+		if err := a.ShellKey(s, core.Key{Code: r, Text: string(r)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// then
+	// ... the other instance shows the echo, on a shell started in the session's folder
+	drain(t, b, func() bool { sc := b.Shell(s); return sc != nil && sc.Rows[0] == "$ ls" })
+	if sh := h.Shells.Opened; len(sh) != 1 || sh[0].Cwd != "/p/wt" {
+		t.Fatalf("opened %+v", sh)
+	}
+
+	// when
+	// ... the shell exits
+	h.Shells.Opened[0].Exit()
+
+	// then
+	// ... neither instance shows it any more, and typing into it is refused
+	drain(t, b, func() bool { return b.Shell(s) == nil })
+	drain(t, a, func() bool { return a.Shell(s) == nil })
+	if err := a.ShellKey(s, core.Key{Code: 'x', Text: "x"}); err == nil {
+		t.Fatal("typed into an exited shell")
+	}
+}
+
+func TestDaemonStaysForAnOpenShell(t *testing.T) {
+	// given
+	// ... a daemon that leaves soon after it goes quiet, and a session with its shell open
+	s := &core.Session{SessionID: "local_1", Title: "render", OriginCwd: "/p", TitleSource: "user"}
+	h := testfakes.NewHarness(t, 80*time.Millisecond, s)
+	c := h.Dial(t)
+	if err := c.OpenShell(s, 80, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	// when
+	// ... every instance detaches
+	c.Close()
+
+	// then
+	// ... the daemon stays, as a multiplexer does for its shells
+	if ended(h, 300*time.Millisecond) {
+		t.Fatal("the daemon exited with a shell open")
+	}
+
+	// when
+	// ... the shell exits and the quiet spell passes
+	h.Shells.Opened[0].Exit()
+
+	// then
+	// ... nothing is left to serve, so it exits
+	if !ended(h, 2*time.Second) {
+		t.Fatal("the daemon outlived its last shell and client")
+	}
 }

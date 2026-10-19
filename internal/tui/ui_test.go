@@ -238,3 +238,35 @@ func TestTypedInputPicksAChoice(t *testing.T) {
 		})
 	}
 }
+
+func TestShellPanelTakesEveryKeyUntilCtrlBackslash(t *testing.T) {
+	// given
+	// ... a session with a turn running, and its shell panel opened with ctrl+t
+	s := &core.Session{SessionID: "local_1", Title: "render", OriginCwd: "/p"}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	app := h.Dial(t)
+	if err := app.Send(s, "go"); err != nil {
+		t.Fatal(err)
+	}
+	u := &UI{app: app, collapsed: map[string]bool{}, cur: s.SessionID, pane: paneSession, shellW: 40, shellH: 10}
+	u.key(uv.KeyPressEvent{Code: 't', Mod: uv.ModCtrl})
+
+	// when
+	// ... keys hearth would take for itself are typed, then ctrl+\
+	for _, k := range []uv.KeyPressEvent{keyPress(':'), keyPress('q'), {Code: 'c', Mod: uv.ModCtrl}, {Code: '\\', Mod: uv.ModCtrl}} {
+		u.key(k)
+	}
+
+	// then
+	// ... the shell got them at the panel's size, the agent was never interrupted, and focus is back on the session with the panel still shown
+	sc := app.Shell(s)
+	for deadline := time.Now().Add(2 * time.Second); (sc == nil || sc.Rows[0] != "$ :q") && time.Now().Before(deadline); sc = app.Shell(s) {
+		app.Drain()
+	}
+	if sc == nil || sc.Rows[0] != "$ :q" || sc.W != 40 || sc.H != 10 {
+		t.Fatalf("screen %+v", sc)
+	}
+	if u.quit || u.pane != paneSession || !u.shellOn[s.SessionID] || len(h.Launcher.Agents[0].Requests) != 0 {
+		t.Fatalf("quit %v pane %d shown %v agent asked %v", u.quit, u.pane, u.shellOn[s.SessionID], h.Launcher.Agents[0].Requests)
+	}
+}

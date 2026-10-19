@@ -13,6 +13,9 @@ the daemon unchanged.
   socket. Spec: `docs/specs/daemon.md`.
 - **`start_agent`.** Subagents as hearth sessions on any backend, shown as tabs of the session that
   started them. Spec: `docs/specs/start-agent.md`.
+- **Shell panel.** One shell per session, in a side panel toggled with ctrl+t. The daemon owns
+  the pty and its screen, so a shell outlives `:q` and every instance shows it, as in a
+  multiplexer. The instance that last focused it sets its size.
 
 ## Next
 

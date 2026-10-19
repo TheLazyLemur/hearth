@@ -9,6 +9,10 @@ type Client interface {
 	// there were any. Read the copy after it, on the goroutine that draws.
 	Drain() bool
 
+	// Frames fires when a shell's screen changed, so a shown shell is drawn at once rather
+	// than at the next tick. Drain applies the change.
+	Frames() <-chan struct{}
+
 	// Closed is closed when the daemon connection ends, and Err says why.
 	Closed() <-chan struct{}
 	Err() error
@@ -55,4 +59,9 @@ type Client interface {
 
 	AcceptChip(s *core.Session, i int) (*core.Session, error)
 	DismissChip(s *core.Session, i int)
+
+	Shell(s *core.Session) *core.Screen
+	OpenShell(s *core.Session, w, h int) error
+	ShellKey(s *core.Session, k core.Key) error
+	ShellPaste(s *core.Session, text string) error
 }

@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the protocol version; a client and a daemon must speak the same one.
-const Version = "1"
+const Version = "2"
 
 // noSession is the error for a request that names a session the daemon no longer has, which
 // happens when another client deleted it first.
@@ -40,25 +40,27 @@ type hello struct {
 }
 
 // snapshot is everything a new client needs to start: every session, the plain data and
-// entries of the loaded ones, each backend's capabilities, the model lists fetched so far
-// and the daemon's notice.
+// entries of the loaded ones, each backend's capabilities, the model lists fetched so far,
+// the screens of the open shells and the daemon's notice.
 type snapshot struct {
 	Sessions []*core.Session         `json:"sessions"`
 	Live     map[string]*core.Live   `json:"live"`
 	Backends map[string]core.Caps    `json:"backends"`
 	Models   map[string][]core.Model `json:"models"`
+	Shells   map[string]*core.Screen `json:"shells"`
 	Notice   string                  `json:"notice"`
 }
 
 // change is what a client is missing of a session: its record, its plain data without
-// entries, and the entries from index splice.From on. Deletion, model listings and the
-// notice are changes of their own.
+// entries, and the entries from index splice.From on. Deletion, model listings, shell
+// screens and the notice are changes of their own.
 type change struct {
 	Session *core.Session `json:"session,omitempty"`
 	Live    *core.Live    `json:"live,omitempty"`
 	Entries *splice       `json:"entries,omitempty"`
 	Deleted string        `json:"deleted,omitempty"`
 	Models  *models       `json:"models,omitempty"`
+	Shell   *shell        `json:"shell,omitempty"`
 	Notice  *string       `json:"notice,omitempty"`
 }
 
@@ -66,6 +68,12 @@ type change struct {
 type splice struct {
 	From  int          `json:"from"`
 	Items []core.Entry `json:"items"`
+}
+
+// shell is what a session's shell shows now; a nil Screen means it exited.
+type shell struct {
+	Session string       `json:"session"`
+	Screen  *core.Screen `json:"screen,omitempty"`
 }
 
 // models is one backend's model list; nil Items while its listing runs.
@@ -83,19 +91,22 @@ type request struct {
 
 // args holds every request's parameters; each method reads the ones it uses.
 type args struct {
-	Session  string `json:"session,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Title    string `json:"title,omitempty"`
-	Model    string `json:"model,omitempty"`
-	Mode     string `json:"mode,omitempty"`
-	Effort   string `json:"effort,omitempty"`
-	Backend  string `json:"backend,omitempty"`
-	Dir      string `json:"dir,omitempty"`
-	Turn     int    `json:"turn,omitempty"`
-	Index    int    `json:"index,omitempty"`
-	Allow    bool   `json:"allow,omitempty"`
-	Always   bool   `json:"always,omitempty"`
-	Worktree bool   `json:"worktree,omitempty"`
+	Session  string    `json:"session,omitempty"`
+	Text     string    `json:"text,omitempty"`
+	Title    string    `json:"title,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Mode     string    `json:"mode,omitempty"`
+	Effort   string    `json:"effort,omitempty"`
+	Backend  string    `json:"backend,omitempty"`
+	Dir      string    `json:"dir,omitempty"`
+	Turn     int       `json:"turn,omitempty"`
+	Index    int       `json:"index,omitempty"`
+	Allow    bool      `json:"allow,omitempty"`
+	Always   bool      `json:"always,omitempty"`
+	Worktree bool      `json:"worktree,omitempty"`
+	W        int       `json:"w,omitempty"`
+	H        int       `json:"h,omitempty"`
+	Key      *core.Key `json:"key,omitempty"`
 }
 
 // reply answers a request. Result is small, never state, and only some methods set it.

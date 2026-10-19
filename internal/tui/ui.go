@@ -27,6 +27,7 @@ var (
 const (
 	paneSidebar = iota
 	paneSession
+	paneShell // the session's shell panel, which takes every key but ctrl+\ and ctrl+t
 )
 
 const (
@@ -133,6 +134,10 @@ type UI struct {
 	tabs         map[string][]*tab          // agent tabs by the session the user started
 	agents       map[string][]*core.Session // every root's agents, as of the last syncTabs
 	count        int                        // tab number typed before gt
+	shellOn      map[string]bool            // sessions whose shell panel this instance shows
+	shellW       int                        // the shell panel's size at the last draw, shown or not
+	shellH       int
+	resized      bool // the window changed size since the last draw
 	now          func() time.Time
 }
 
@@ -148,7 +153,7 @@ func Run(app Client, launched string) error {
 	}
 	tick := time.NewTicker(120 * time.Millisecond) // spinner frames
 	defer tick.Stop()
-	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched, tabs: map[string][]*tab{}, now: time.Now}
+	u := &UI{app: app, scr: scr, ctx: screen.NewContext(scr), collapsed: map[string]bool{}, launched: launched, tabs: map[string][]*tab{}, shellOn: map[string]bool{}, now: time.Now}
 	if vs := app.Visible(false); len(vs) > 0 {
 		u.cur, u.sel = vs[0].SessionID, vs[0].SessionID
 	}
@@ -167,6 +172,9 @@ func Run(app Client, launched string) error {
 				return nil
 			}
 			u.event(ev)
+		case <-u.app.Frames():
+			// the last draw's own requests may have drained this frame after the panel was drawn
+			u.app.Drain()
 		case <-tick.C:
 			if !fresh && !u.app.AnyRunning() && !u.closing() {
 				continue
@@ -225,9 +233,14 @@ func (u *UI) event(ev uv.Event) {
 	switch ev := ev.(type) {
 	case uv.WindowSizeEvent:
 		u.scr.Resize(ev.Width, ev.Height)
+		u.resized = true
 	case uv.PasteEvent:
 		text := strings.ReplaceAll(ev.Content, "\r\n", "\n")
 		switch {
+		case u.pane == paneShell && u.pick == nil:
+			if s := u.session(); s != nil {
+				u.must(u.app.ShellPaste(s, ev.Content))
+			}
 		case u.pick != nil:
 			u.pick.query = append(u.pick.query, []rune(strings.ReplaceAll(text, "\n", " "))...)
 			u.refreshPicker()
@@ -250,6 +263,10 @@ func (u *UI) key(k uv.KeyPressEvent) {
 	s := u.session()
 	lead := u.lead
 	u.lead = false
+	if u.pane == paneShell && s != nil {
+		u.shellKey(s, k)
+		return
+	}
 	if k.MatchString("ctrl+c") {
 		if s != nil && u.app.Status(s) == "running" {
 			u.app.Interrupt(s)
@@ -260,6 +277,10 @@ func (u *UI) key(k uv.KeyPressEvent) {
 	}
 	if u.prompt != nil {
 		u.promptKey(k)
+		return
+	}
+	if s != nil && k.MatchString("ctrl+t") {
+		u.toggleShell(s)
 		return
 	}
 	if u.idleNormal(s) && u.leader(k, lead) {
@@ -361,6 +382,37 @@ func (u *UI) sidebarKey(seq string) {
 		u.app.ToggleArchive(r.s)
 	case "dd":
 		u.confirmDelete(r.s)
+	}
+}
+
+// toggleShell moves focus to s's shell panel, showing it and starting the shell when
+// needed, or hides the panel when it has focus; a hidden shell runs on. Focusing it sizes
+// the shell to this instance's panel.
+func (u *UI) toggleShell(s *core.Session) {
+	if u.pane == paneShell {
+		delete(u.shellOn, s.SessionID)
+		u.pane = paneSession
+		return
+	}
+	if err := u.app.OpenShell(s, u.shellW, u.shellH); err != nil {
+		u.app.SetNotice(err.Error())
+		return
+	}
+	if u.shellOn == nil {
+		u.shellOn = map[string]bool{}
+	}
+	u.shellOn[s.SessionID], u.pane = true, paneShell
+}
+
+// shellKey hands k to s's shell; only ctrl+\ (back to the session) and ctrl+t (hide) stay hearth's.
+func (u *UI) shellKey(s *core.Session, k uv.KeyPressEvent) {
+	switch {
+	case k.MatchString("ctrl+\\"):
+		u.pane = paneSession
+	case k.MatchString("ctrl+t"):
+		u.toggleShell(s)
+	default:
+		u.must(u.app.ShellKey(s, core.Key{Code: k.Code, Text: k.Text, Mod: int(k.Mod)}))
 	}
 }
 
@@ -741,6 +793,8 @@ func (u *UI) command(line string) {
 		}
 	case "dismiss":
 		u.app.DismissChip(s, n-1)
+	case "term":
+		u.toggleShell(s)
 	case "tabclose", "tabc":
 		u.closeTab(s)
 	case "unqueue":
@@ -1031,6 +1085,8 @@ func inline(l string, st uv.Style) []span {
 
 func (u *UI) modeName() string {
 	switch {
+	case u.pane == paneShell:
+		return "SHELL"
 	case u.pane != paneSession:
 		return "NORMAL"
 	case u.focus == focusInput && u.ed.mode == modeInsert:
@@ -1070,6 +1126,11 @@ func (u *UI) draw() {
 	x, w := sw+3, W-sw-5
 	scr.HideCursor()
 	s := u.session()
+	if s != nil {
+		w = u.shellPanel(s, x, w, H)
+	} else if u.pane == paneShell {
+		u.pane = paneSession
+	}
 	var l *core.Live
 	if s != nil {
 		u.app.EnsureLoaded(s)
@@ -1085,7 +1146,7 @@ func (u *UI) draw() {
 		scr.ShowCursor()
 	}
 	shape := uv.CursorBlock
-	if u.modeName() == "INSERT" || u.prompt != nil || u.searching() {
+	if u.modeName() == "INSERT" || u.prompt != nil || u.searching() || u.pane == paneShell {
 		shape = uv.CursorBar
 	}
 	scr.SetCursorStyle(shape, false)
@@ -1139,6 +1200,47 @@ func (u *UI) draw() {
 	// a frame that only moves the cursor needs a second pass to show it (grimalkin's present)
 	scr.Render()
 	scr.Flush()
+}
+
+// shellPanel draws s's shell panel at the right of the main pane, x to x+w, when this
+// instance shows it, and returns the width left for the transcript. It drops a panel whose
+// shell has exited, and sizes the shell to the panel when the window changed under it.
+func (u *UI) shellPanel(s *core.Session, x, w, h int) int {
+	pw := w / 2
+	u.shellW, u.shellH = pw, h-1
+	resized := u.resized
+	u.resized = false
+	sc := u.app.Shell(s)
+	if sc == nil {
+		delete(u.shellOn, s.SessionID)
+	}
+	if !u.shellOn[s.SessionID] {
+		if u.pane == paneShell {
+			u.pane = paneSession
+		}
+		return w
+	}
+	if resized && u.pane == paneShell && (sc.W != u.shellW || sc.H != u.shellH) {
+		u.must(u.app.OpenShell(s, u.shellW, u.shellH)) // the new screen comes with the next frame
+	}
+	px := x + w - pw + 2 // the panel takes the right margin too
+	hint := "ctrl+t focus"
+	if u.pane == paneShell {
+		hint = "ctrl+\\ back · ctrl+t hide"
+	}
+	u.put(px, 0, pw, "shell · "+hint, fg(th.inactive))
+	for y := 0; y < h; y++ {
+		u.put(px-2, y, 1, "│", fg(th.subtle))
+	}
+	// shortcut: a screen sized by a bigger instance is clipped here; scrollback isn't shown
+	for i, row := range sc.Rows[:min(len(sc.Rows), h-1)] {
+		uv.NewStyledString(row).Draw(u.scr, uv.Rect(px, 1+i, pw, 1))
+	}
+	if u.pane == paneShell && sc.CursorOn && sc.CursorX < pw && sc.CursorY < h-1 {
+		u.scr.SetCursorPosition(px+sc.CursorX, 1+sc.CursorY)
+		u.scr.ShowCursor()
+	}
+	return px - x - 3
 }
 
 // drawViewMarks reverses the visual selection and search matches, and puts the
@@ -1521,6 +1623,7 @@ func (u *UI) footer(s *core.Session, w int) []line {
 				"VIEW    h j k l w b e 0 $ gg G · ^d ^u ^f ^b · { } · / ? n N · v V o y yy y$ · j past end → NORMAL · i insert · " +
 				"x unqueue · m mode · M model · R rewind · t task · dd delete · esc interrupt · gf open agent\n" +
 				"TABS    gt gT {n}gt switch · :tabclose or :q close an agent's tab\n" +
+				"SHELL   ctrl+t or :term open/focus/hide · ctrl+\\ back to the session · every other key goes to the shell\n" +
 				"        space space sessions · space / grep · ctrl+h list · :backend :effort :model :mode :rename :rewind :task · ctrl+c interrupt · :q quit"
 		}
 		out = append(out, wrap([]span{{help, dim}}, w, span{"  ", uv.Style{}}, nil)...)
