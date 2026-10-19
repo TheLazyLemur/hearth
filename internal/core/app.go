@@ -30,7 +30,8 @@ type Live struct {
 	Loaded       bool // the transcript was read into Entries
 	Errored      bool // the last turn failed
 	agent        Agent
-	interrupted  bool // the running turn was interrupted by the user
+	shell        Shell // the side panel's terminal, nil until opened
+	interrupted  bool  // the running turn was interrupted by the user
 	pending      map[string]func(Reply)
 	asked        string // id of the request PreviewRewind or Unqueue last put to the agent
 	wantWorktree bool
@@ -45,6 +46,7 @@ type App struct {
 	models    map[string][]Model // by backend, once listed
 	modelErrs map[string]error   // by backend: why its listing failed
 	worktrees Worktrees
+	shells    Shells
 	sessions  []*Session
 	live      map[string]*Live
 	events    chan AgentEvent
@@ -53,7 +55,7 @@ type App struct {
 }
 
 // NewApp needs backends to hold DefaultBackend.
-func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees) (*App, error) {
+func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees, shells Shells) (*App, error) {
 	if _, ok := backends[DefaultBackend]; !ok {
 		panic("no " + DefaultBackend + " backend")
 	}
@@ -69,7 +71,7 @@ func NewApp(store SessionStore, backends map[string]Backend, worktrees Worktrees
 			return nil, fmt.Errorf("session %s uses unknown backend %q", s.SessionID, s.Backend)
 		}
 	}
-	return &App{store: store, backends: backends, models: map[string][]Model{}, modelErrs: map[string]error{}, worktrees: worktrees, sessions: ss,
+	return &App{store: store, backends: backends, models: map[string][]Model{}, modelErrs: map[string]error{}, worktrees: worktrees, shells: shells, sessions: ss,
 		live: map[string]*Live{}, events: make(chan AgentEvent, 256), now: func() int64 { return time.Now().UnixMilli() }}, nil
 }
 
@@ -449,6 +451,10 @@ func (a *App) Delete(s *Session) error {
 		l.agent.Close()
 		l.agent = nil
 	}
+	if l.shell != nil {
+		l.shell.Close()
+		l.shell = nil
+	}
 	if s.WorktreePath != "" {
 		if err := a.worktrees.Remove(s.OriginCwd, s.WorktreePath); err != nil {
 			return fmt.Errorf("kept session, worktree not removed: %w", err)
@@ -556,6 +562,9 @@ func (a *App) CloseAll() {
 	for _, l := range a.live {
 		if l.agent != nil {
 			l.agent.Close()
+		}
+		if l.shell != nil {
+			l.shell.Close()
 		}
 	}
 }
@@ -680,6 +689,12 @@ func (a *App) Handle(m AgentEvent) {
 		e.Reply("That task was already started or dismissed; do not retry.", false)
 	case AgentRequested:
 		a.startAgent(s, e)
+	case ShellChanged:
+		// the screen lives in the shell; clients read it from there
+	case ShellExited:
+		if l.shell == e.Shell { // not a shell opened since
+			l.shell = nil
+		}
 	case Reply:
 		cb, ok := l.pending[e.RequestID]
 		if !ok {

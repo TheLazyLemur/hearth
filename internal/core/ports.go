@@ -25,6 +25,39 @@ type Worktrees interface {
 	Remove(originCwd, path string) error
 }
 
+// Shells starts the terminal a session's side panel shows.
+type Shells interface {
+	// Open starts a shell in cwd on a w×h screen. It sends ShellChanged on out when the
+	// screen changes, a few times a second at most, and ShellExited once when the shell ends.
+	Open(sessionID, cwd string, w, h int, out chan<- AgentEvent) (Shell, error)
+}
+
+// Shell is one running shell and the screen its terminal shows.
+type Shell interface {
+	Key(k Key)
+	Paste(text string)
+	Resize(w, h int)
+	Screen() *Screen
+	Close()
+}
+
+// Key is one key press for a shell: the code, the text it types and its modifiers, as
+// ultraviolet reports them.
+type Key struct {
+	Code rune   `json:"code"`
+	Text string `json:"text,omitempty"`
+	Mod  int    `json:"mod,omitempty"`
+}
+
+// Screen is what a shell's terminal shows: one ANSI-styled string per row, and the cursor.
+type Screen struct {
+	W, H     int
+	Rows     []string
+	CursorX  int
+	CursorY  int
+	CursorOn bool
+}
+
 // Backend is an agent harness a session can run on, and which optional features it has.
 type Backend struct {
 	Label           string // e.g. "Claude Code"
@@ -130,6 +163,10 @@ type (
 		Rewind    RewindPreview
 	}
 	Exited struct{ Err error }
+	// ShellChanged: the session's shell has new output on its screen.
+	ShellChanged struct{}
+	// ShellExited: Shell, the session's shell, ended.
+	ShellExited struct{ Shell Shell }
 	// ModelsListed carries a backend's model list.
 	ModelsListed struct {
 		Backend string
@@ -152,4 +189,6 @@ func (TaskDismissed) event()       {}
 func (AgentRequested) event()      {}
 func (Reply) event()               {}
 func (Exited) event()              {}
+func (ShellChanged) event()        {}
+func (ShellExited) event()         {}
 func (ModelsListed) event()        {}

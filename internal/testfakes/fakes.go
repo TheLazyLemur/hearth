@@ -68,6 +68,40 @@ func (l *Launcher) Start(s *core.Session, tools []map[string]any, out chan<- cor
 	return ag, nil
 }
 
+// Shells opens recording shells whose screen shows what was typed into them.
+type Shells struct{ Opened []*Shell }
+
+func (f *Shells) Open(sessionID, cwd string, w, h int, out chan<- core.AgentEvent) (core.Shell, error) {
+	sh := &Shell{id: sessionID, Cwd: cwd, W: w, H: h, out: out}
+	f.Opened = append(f.Opened, sh)
+	return sh, nil
+}
+
+// Shell echoes keys onto one row, as a shell at its prompt would, and reports each echo.
+type Shell struct {
+	Cwd    string
+	W, H   int
+	Typed  string
+	Closed bool
+	id     string
+	out    chan<- core.AgentEvent
+}
+
+func (s *Shell) Key(k core.Key) {
+	s.Typed += k.Text
+	s.out <- core.AgentEvent{SessionID: s.id, Event: core.ShellChanged{}}
+}
+
+func (s *Shell) Paste(text string) { s.Key(core.Key{Text: text}) }
+func (s *Shell) Resize(w, h int)   { s.W, s.H = w, h }
+func (s *Shell) Screen() *core.Screen {
+	return &core.Screen{W: s.W, H: s.H, Rows: []string{"$ " + s.Typed}, CursorX: 2 + len(s.Typed), CursorOn: true}
+}
+func (s *Shell) Close() { s.Closed = true }
+
+// Exit ends the shell, as typing exit into it would.
+func (s *Shell) Exit() { s.out <- core.AgentEvent{SessionID: s.id, Event: core.ShellExited{Shell: s}} }
+
 // AllowCall is one permission the app answered with allow.
 type AllowCall struct {
 	RequestID   string
@@ -126,6 +160,7 @@ type Fakes struct {
 	Worktrees   *Worktrees
 	Launcher    *Launcher // the default backend's
 	PiLauncher  *Launcher // a backend without rewind or unqueue
+	Shells      *Shells
 }
 
 // App builds an app over fresh fakes: claude, which can rewind and unqueue, and pi, which
@@ -133,11 +168,11 @@ type Fakes struct {
 func App(t *testing.T, loaded ...*core.Session) (*core.App, *Fakes) {
 	t.Helper()
 	f := &Fakes{Store: &Store{Loaded: loaded, Saved: map[string]core.Session{}}, Transcripts: Transcripts{},
-		Worktrees: &Worktrees{}, Launcher: &Launcher{}, PiLauncher: &Launcher{}}
+		Worktrees: &Worktrees{}, Launcher: &Launcher{}, PiLauncher: &Launcher{}, Shells: &Shells{}}
 	a, err := core.NewApp(f.Store, map[string]core.Backend{
 		core.DefaultBackend: {Label: "Claude Code", Tag: "cl", Launcher: f.Launcher, Transcripts: f.Transcripts, Rewind: true, Unqueue: true},
 		"pi":                {Label: "pi", Tag: "pi", Launcher: f.PiLauncher, Transcripts: f.Transcripts},
-	}, f.Worktrees)
+	}, f.Worktrees, f.Shells)
 	if err != nil {
 		t.Fatal(err)
 	}

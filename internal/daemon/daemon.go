@@ -294,7 +294,7 @@ func marshal(m msg) []byte {
 // the changes that follow only carry what is new.
 func (d *Daemon) snapshot(p *peer) snapshot {
 	snap := snapshot{Live: map[string]*core.Live{}, Backends: d.app.Caps(),
-		Models: d.app.ListedModels()}
+		Models: d.app.ListedModels(), Shells: map[string]*core.Screen{}}
 	for _, s := range d.app.Sessions() {
 		l := d.app.L(s.SessionID)
 		live := *l
@@ -304,6 +304,9 @@ func (d *Daemon) snapshot(p *peer) snapshot {
 		snap.Sessions = append(snap.Sessions, s)
 		snap.Live[s.SessionID] = &live
 		p.sent[s.SessionID] = len(live.Entries)
+		if sc := d.app.Shell(s); sc != nil {
+			snap.Shells[s.SessionID] = sc
+		}
 	}
 	d.mu.Lock()
 	snap.Notice = d.notice
@@ -313,6 +316,12 @@ func (d *Daemon) snapshot(p *peer) snapshot {
 
 // event applies one agent report and tells clients what it changed.
 func (d *Daemon) event(m core.AgentEvent) {
+	switch m.Event.(type) {
+	case core.ShellChanged, core.ShellExited: // the session record and transcript stay as they were
+		d.app.Handle(m)
+		d.shellChanged(m.SessionID)
+		return
+	}
 	before := len(d.app.Sessions())
 	d.app.Handle(m)
 	d.failWaits(m)
@@ -345,6 +354,15 @@ func (d *Daemon) changed(id string) {
 	for _, p := range peers {
 		d.queue(p, marshal(msg{Change: d.change(p, s)}))
 	}
+}
+
+// shellChanged tells clients what a session's shell shows now, or that it exited.
+func (d *Daemon) shellChanged(id string) {
+	s := d.app.Find(id)
+	if s == nil {
+		return // deleted, and its shell with it
+	}
+	d.send(msg{Change: &change{Shell: &shell{Session: id, Screen: d.app.Shell(s)}}})
 }
 
 // forget drops a deleted session from every client's bookkeeping.
@@ -468,6 +486,17 @@ func (d *Daemon) apply(p *peer, id int, method string, a args) (any, error) {
 		err := d.app.SetBackend(s(), a.Backend)
 		d.changed(a.Session)
 		return nil, err
+	case "openShell":
+		err := d.app.OpenShell(s(), a.W, a.H)
+		d.shellChanged(a.Session)
+		return nil, err
+	case "shellKey":
+		if a.Key == nil {
+			return nil, errors.New("shellKey: no key")
+		}
+		return nil, d.app.ShellKey(s(), *a.Key) // the echo arrives as ShellChanged
+	case "shellPaste":
+		return nil, d.app.ShellPaste(s(), a.Text)
 	case "models":
 		d.app.Models(s()) // starts the listing; the list arrives as a change
 		return nil, nil
@@ -571,11 +600,11 @@ func (d *Daemon) count() int {
 }
 
 // running lists the sessions a stop would cut short: a running turn, a pending
-// permission or a queued message.
+// permission, a queued message or an open shell.
 func (d *Daemon) running() []string {
 	var out []string
 	for _, s := range d.app.Sessions() {
-		if l := d.app.L(s.SessionID); l.Running || len(l.Perms) > 0 || len(l.Queued) > 0 {
+		if l := d.app.L(s.SessionID); l.Running || len(l.Perms) > 0 || len(l.Queued) > 0 || d.app.HasShell(s) {
 			out = append(out, cmp.Or(s.Title, s.SessionID))
 		}
 	}

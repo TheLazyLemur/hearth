@@ -26,6 +26,7 @@ type Client struct {
 	live     map[string]*core.Live
 	backends map[string]core.Caps
 	models   map[string][]core.Model
+	shells   map[string]*core.Screen
 	notice   string
 
 	encMu   sync.Mutex // one request on the wire at a time
@@ -34,6 +35,7 @@ type Client struct {
 	pending map[int]chan reply
 	next    int
 	changes []*change
+	frames  chan struct{} // one pending wake-up for a shell screen change
 	closed  chan struct{}
 	err     error
 
@@ -64,8 +66,8 @@ func NewClient(conn net.Conn) (*Client, error) { return NewClientVersion(conn, V
 // the client.
 func NewClientVersion(conn net.Conn, version string) (*Client, error) {
 	c := &Client{conn: conn, enc: json.NewEncoder(conn), dec: json.NewDecoder(conn),
-		live: map[string]*core.Live{}, backends: map[string]core.Caps{}, models: map[string][]core.Model{},
-		pending: map[int]chan reply{}, closed: make(chan struct{})}
+		live: map[string]*core.Live{}, backends: map[string]core.Caps{}, models: map[string][]core.Model{}, shells: map[string]*core.Screen{},
+		pending: map[int]chan reply{}, frames: make(chan struct{}, 1), closed: make(chan struct{})}
 	if err := c.enc.Encode(msg{Hello: &hello{Version: version}}); err != nil {
 		conn.Close()
 		return nil, err
@@ -109,6 +111,12 @@ func (c *Client) read() {
 		case m.Change != nil:
 			c.changes = append(c.changes, m.Change)
 			c.mu.Unlock()
+			if m.Change.Shell != nil {
+				select {
+				case c.frames <- struct{}{}:
+				default: // a wake-up is already waiting; one draw takes both
+				}
+			}
 		case m.Bye != "":
 			c.err = errors.New("disconnected: " + m.Bye)
 			c.mu.Unlock()
@@ -135,6 +143,9 @@ func (c *Client) take(s *snapshot) {
 	for b, ms := range s.Models {
 		c.models[b] = ms
 	}
+	for id, sc := range s.Shells {
+		c.shells[id] = sc
+	}
 }
 
 // Drain applies the changes the daemon sent since the last call, reporting whether there
@@ -154,6 +165,7 @@ func (c *Client) Drain() bool {
 func (c *Client) applyChange(ch *change) {
 	if ch.Deleted != "" {
 		delete(c.live, ch.Deleted)
+		delete(c.shells, ch.Deleted)
 		c.ss = slices.DeleteFunc(c.ss, func(s *core.Session) bool { return s.SessionID == ch.Deleted })
 		return
 	}
@@ -162,6 +174,11 @@ func (c *Client) applyChange(ch *change) {
 	}
 	if ch.Notice != nil {
 		c.notice = *ch.Notice
+	}
+	if sh := ch.Shell; sh != nil && sh.Screen != nil {
+		c.shells[sh.Session] = sh.Screen
+	} else if sh != nil {
+		delete(c.shells, sh.Session)
 	}
 	if ch.Session == nil {
 		return
@@ -184,6 +201,9 @@ func (c *Client) applyChange(ch *change) {
 	}
 	c.live[s.SessionID] = l
 }
+
+// Frames fires when a shell's screen changed since the last time it fired.
+func (c *Client) Frames() <-chan struct{} { return c.frames }
 
 // Closed is closed when the daemon connection ends.
 func (c *Client) Closed() <-chan struct{} { return c.closed }
@@ -452,6 +472,24 @@ func (c *Client) AcceptChip(s *core.Session, i int) (*core.Session, error) {
 // DismissChip drops the chip at index i.
 func (c *Client) DismissChip(s *core.Session, i int) {
 	c.check("dismissChip", args{Session: s.SessionID, Index: i}, nil)
+}
+
+// Shell is what s's shell shows, nil when it has none.
+func (c *Client) Shell(s *core.Session) *core.Screen { return c.shells[s.SessionID] }
+
+// OpenShell starts s's shell on a w×h screen, or gives the running one that size.
+func (c *Client) OpenShell(s *core.Session, w, h int) error {
+	return c.result("openShell", args{Session: s.SessionID, W: w, H: h}, nil)
+}
+
+// ShellKey types k into s's shell.
+func (c *Client) ShellKey(s *core.Session, k core.Key) error {
+	return c.result("shellKey", args{Session: s.SessionID, Key: &k}, nil)
+}
+
+// ShellPaste pastes text into s's shell.
+func (c *Client) ShellPaste(s *core.Session, text string) error {
+	return c.result("shellPaste", args{Session: s.SessionID, Text: text}, nil)
 }
 
 // Stop asks the daemon to exit.
