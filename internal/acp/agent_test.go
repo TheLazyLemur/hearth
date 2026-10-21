@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,9 +18,31 @@ import (
 	"hearth/internal/core"
 )
 
-// fakeAgent is an ACP agent on the agent side of the SDK. onPrompt scripts each turn.
+// agentConn is an agent's connection to hearth. It is a bare Connection because the SDK's agent side
+// can't send mcp/message.
+type agentConn struct{ *acpsdk.Connection }
+
+func (c agentConn) SessionUpdate(ctx context.Context, n acpsdk.SessionNotification) error {
+	return c.SendNotification(ctx, acpsdk.ClientMethodSessionUpdate, n)
+}
+
+func (c agentConn) RequestPermission(ctx context.Context, r acpsdk.RequestPermissionRequest) (acpsdk.RequestPermissionResponse, error) {
+	return acpsdk.SendRequest[acpsdk.RequestPermissionResponse](c.Connection, ctx, acpsdk.ClientMethodSessionRequestPermission, r)
+}
+
+func (c agentConn) McpConnect(ctx context.Context, acpID string) (acpsdk.UnstableMcpConnectionId, error) {
+	r, err := acpsdk.SendRequest[acpsdk.UnstableConnectMcpResponse](c.Connection, ctx, acpsdk.ClientMethodMcpConnect, acpsdk.UnstableConnectMcpRequest{AcpId: acpsdk.UnstableMcpServerAcpId(acpID)})
+	return r.ConnectionId, err
+}
+
+func (c agentConn) McpMessage(ctx context.Context, id acpsdk.UnstableMcpConnectionId, method string, params map[string]any) (map[string]any, error) {
+	return acpsdk.SendRequest[map[string]any](c.Connection, ctx, acpsdk.ClientMethodMcpMessage, acpsdk.UnstableMessageMcpRequest{ConnectionId: id, Method: method, Params: params})
+}
+
+// fakeAgent is an ACP agent on the agent side of a connection. onPrompt scripts each turn.
 type fakeAgent struct {
-	conn      *acpsdk.AgentSideConnection
+	conn      agentConn
+	mcp       bool // advertises mcpCapabilities.acp
 	onPrompt  func(ctx context.Context, text string) (acpsdk.PromptResponse, error)
 	newErr    error
 	canLoad   bool                                           // advertises loadSession
@@ -36,7 +59,23 @@ type fakeAgent struct {
 
 func (a *fakeAgent) Initialize(context.Context, acpsdk.InitializeRequest) (acpsdk.InitializeResponse, error) {
 	return acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber, AgentInfo: &acpsdk.Implementation{Name: "fake", Version: "9.9"},
-		AgentCapabilities: acpsdk.AgentCapabilities{LoadSession: a.canLoad}}, nil
+		AgentCapabilities: acpsdk.AgentCapabilities{LoadSession: a.canLoad, McpCapabilities: acpsdk.McpCapabilities{Acp: a.mcp}}}, nil
+}
+
+func (a *fakeAgent) handle(ctx context.Context, method string, raw json.RawMessage) (any, *acpsdk.RequestError) {
+	switch method {
+	case acpsdk.AgentMethodInitialize:
+		return serve(raw, func(r acpsdk.InitializeRequest) (any, error) { return a.Initialize(ctx, r) })
+	case acpsdk.AgentMethodSessionNew:
+		return serve(raw, func(r acpsdk.NewSessionRequest) (any, error) { return a.NewSession(ctx, r) })
+	case acpsdk.AgentMethodSessionLoad:
+		return serve(raw, func(r acpsdk.LoadSessionRequest) (any, error) { return a.LoadSession(ctx, r) })
+	case acpsdk.AgentMethodSessionPrompt:
+		return serve(raw, func(r acpsdk.PromptRequest) (any, error) { return a.Prompt(ctx, r) })
+	case acpsdk.AgentMethodSessionCancel:
+		return serve(raw, func(r acpsdk.CancelNotification) (any, error) { return nil, a.Cancel(ctx, r) })
+	}
+	return nil, acpsdk.NewMethodNotFound(method)
 }
 
 func (a *fakeAgent) LoadSession(ctx context.Context, r acpsdk.LoadSessionRequest) (acpsdk.LoadSessionResponse, error) {
@@ -102,28 +141,6 @@ func (a *fakeAgent) say(ctx context.Context, chunks ...string) error {
 	return nil
 }
 
-func (*fakeAgent) Authenticate(context.Context, acpsdk.AuthenticateRequest) (acpsdk.AuthenticateResponse, error) {
-	return acpsdk.AuthenticateResponse{}, nil
-}
-func (*fakeAgent) Logout(context.Context, acpsdk.LogoutRequest) (acpsdk.LogoutResponse, error) {
-	return acpsdk.LogoutResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodLogout)
-}
-func (*fakeAgent) CloseSession(context.Context, acpsdk.CloseSessionRequest) (acpsdk.CloseSessionResponse, error) {
-	return acpsdk.CloseSessionResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodSessionClose)
-}
-func (*fakeAgent) ListSessions(context.Context, acpsdk.ListSessionsRequest) (acpsdk.ListSessionsResponse, error) {
-	return acpsdk.ListSessionsResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodSessionList)
-}
-func (*fakeAgent) ResumeSession(context.Context, acpsdk.ResumeSessionRequest) (acpsdk.ResumeSessionResponse, error) {
-	return acpsdk.ResumeSessionResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodSessionResume)
-}
-func (*fakeAgent) SetSessionConfigOption(context.Context, acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
-	return acpsdk.SetSessionConfigOptionResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodSessionSetConfigOption)
-}
-func (*fakeAgent) SetSessionMode(context.Context, acpsdk.SetSessionModeRequest) (acpsdk.SetSessionModeResponse, error) {
-	return acpsdk.SetSessionModeResponse{}, acpsdk.NewMethodNotFound(acpsdk.AgentMethodSessionSetMode)
-}
-
 // replies is a turn that streams chunks and ends.
 func replies(a *fakeAgent, chunks ...string) func(context.Context, string) (acpsdk.PromptResponse, error) {
 	return func(ctx context.Context, _ string) (acpsdk.PromptResponse, error) {
@@ -137,7 +154,7 @@ func launcher(t *testing.T, agent *fakeAgent) Launcher {
 	toAgentR, toAgentW := io.Pipe()
 	fromAgentR, fromAgentW := io.Pipe()
 	agent.cancelled = make(chan struct{})
-	agent.conn = acpsdk.NewAgentSideConnection(agent, fromAgentW, toAgentR)
+	agent.conn = agentConn{acpsdk.NewConnection(agent.handle, fromAgentW, toAgentR)}
 	agent.exit = func() { fromAgentW.Close(); toAgentR.Close() }
 	t.Cleanup(agent.exit)
 	return Launcher{spawn: func(string) (transport, error) {
@@ -150,7 +167,7 @@ func start(t *testing.T, agent *fakeAgent, s *core.Session) (core.Agent, chan co
 	t.Helper()
 	l := launcher(t, agent)
 	out := make(chan core.AgentEvent, 64)
-	ag, err := l.Start(s, nil, out)
+	ag, err := l.Start(s, core.Tools, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +492,6 @@ func TestUnsupportedRequestsReplyWithAnError(t *testing.T) {
 		want string
 	}{
 		{"cancel queued", func(a core.Agent) string { return a.CancelQueued("u1") }, "this agent does not support cancelling one queued message yet"},
-		{"permission mode", func(a core.Agent) string { return a.SetPermissionMode("plan") }, "this agent does not support permission modes yet"},
 		{"model", func(a core.Agent) string { return a.SetModel("m") }, "this agent does not support switching models yet"},
 		{"effort", func(a core.Agent) string { return a.SetEffort("high") }, "this agent does not support setting an effort yet"},
 		{"rename", func(a core.Agent) string { return a.Rename("t") }, "this agent does not support renaming a session yet"},

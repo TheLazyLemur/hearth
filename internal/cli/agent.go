@@ -231,36 +231,17 @@ func (p *process) control(m map[string]any) core.Event {
 // to core as events whose Reply sends the result.
 func (p *process) mcp(reqID string, m map[string]any) core.Event {
 	reply := func(resp map[string]any) { p.respond(reqID, map[string]any{"mcp_response": resp}) }
-	id, hasID := m["id"]
-	if !hasID {
+	if _, hasID := m["id"]; !hasID {
 		reply(map[string]any{"jsonrpc": "2.0", "result": map[string]any{}, "id": 0}) // notification, as the SDK does
 		return nil
 	}
-	params, _ := m["params"].(map[string]any)
-	ok := func(result any) { reply(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}) }
-	text := func(t string, isErr bool) {
-		ok(map[string]any{"content": []any{map[string]any{"type": "text", "text": t}}, "isError": isErr})
+	tools := make([]map[string]any, len(p.tools))
+	for i, t := range p.tools {
+		// Claude Code's tool search would otherwise defer them, hiding them until the model searches.
+		tools[i] = maps.Clone(t)
+		tools[i]["_meta"] = map[string]any{"anthropic/alwaysLoad": true}
 	}
-	switch m["method"] {
-	case "initialize":
-		ok(map[string]any{"protocolVersion": params["protocolVersion"], "capabilities": map[string]any{"tools": map[string]any{}},
-			"serverInfo": map[string]any{"name": mcpServerName, "version": "0.1.0"}})
-		return nil
-	case "tools/list":
-		tools := make([]map[string]any, len(p.tools))
-		for i, t := range p.tools {
-			// Claude Code's tool search would otherwise defer them, hiding them until the model searches.
-			tools[i] = maps.Clone(t)
-			tools[i]["_meta"] = map[string]any{"anthropic/alwaysLoad": true}
-		}
-		ok(map[string]any{"tools": tools})
-		return nil
-	case "tools/call":
-		args, _ := params["arguments"].(map[string]any)
-		return core.CallTool(str(params["name"]), args, text)
-	}
-	reply(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32601, "message": "method not found"}})
-	return nil
+	return core.ServeMCP(m, tools, mcpServerName, reply)
 }
 
 func (p *process) send(v any) error {

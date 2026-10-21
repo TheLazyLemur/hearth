@@ -48,3 +48,29 @@ func CallTool(name string, args map[string]any, reply func(text string, isErr bo
 	reply(fmt.Sprintf("unknown tool %v", name), true)
 	return nil
 }
+
+// ServeMCP answers one MCP JSON-RPC request m an agent sent to hearth's server: initialize and
+// tools/list (over tools) at once, tools/call through CallTool. reply gets the whole JSON-RPC
+// response, once; for tools/call it is called when core answers the returned event.
+func ServeMCP(m map[string]any, tools []map[string]any, name string, reply func(resp map[string]any)) Event {
+	id := m["id"]
+	params, _ := m["params"].(map[string]any)
+	ok := func(result any) { reply(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}) }
+	switch m["method"] {
+	case "initialize":
+		ok(map[string]any{"protocolVersion": params["protocolVersion"], "capabilities": map[string]any{"tools": map[string]any{}},
+			"serverInfo": map[string]any{"name": name, "version": "0.1.0"}})
+		return nil
+	case "tools/list":
+		ok(map[string]any{"tools": tools})
+		return nil
+	case "tools/call":
+		args, _ := params["arguments"].(map[string]any)
+		toolName, _ := params["name"].(string)
+		return CallTool(toolName, args, func(text string, isErr bool) {
+			ok(map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}, "isError": isErr})
+		})
+	}
+	reply(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32601, "message": "method not found"}})
+	return nil
+}

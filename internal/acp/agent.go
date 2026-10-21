@@ -26,7 +26,7 @@ var (
 )
 
 // Launcher starts an ACP agent: Binary with Args, speaking ACP on stdio.
-// So far it runs one text turn at a time; every other Agent request replies with an error.
+// Model and effort changes, renaming, titles, rewinding and cancelling one queued message reply with an error so far.
 type Launcher struct {
 	Binary string
 	Args   []string
@@ -74,8 +74,7 @@ func (t Transcripts) Load(cwd, cliSessionID string) ([]core.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &process{tp: tp}
-	p.conn = acpsdk.NewClientSideConnection(client{p}, tp.in, tp.out)
+	p := newProcess(tp)
 	go func() { // reaps the process
 		<-p.conn.Done()
 		tp.wait()
@@ -90,7 +89,7 @@ func (t Transcripts) Load(cwd, cliSessionID string) ([]core.Entry, error) {
 	if !init.AgentCapabilities.LoadSession {
 		return nil, errors.New("this agent's session history is not restored yet")
 	}
-	return p.load(ctx, acpsdk.SessionId(cliSessionID), cwd)
+	return p.load(ctx, acpsdk.SessionId(cliSessionID), cwd, []acpsdk.McpServer{}) // it runs no turn, so it needs no tools
 }
 
 // replay is a session's conversation as session/load streams it back.
@@ -105,6 +104,14 @@ func (r *replay) add(u acpsdk.SessionUpdate) {
 		kind, c = "user", u.UserMessageChunk.Content
 	case u.AgentMessageChunk != nil:
 		kind, c = "assistant", u.AgentMessageChunk.Content
+	case u.ToolCall != nil:
+		r.entries = append(r.entries, toolEntry(u.ToolCall))
+		return
+	case u.ToolCallUpdate != nil:
+		if e, ok := resultEntry(u.ToolCallUpdate); ok {
+			r.entries = append(r.entries, e)
+		}
+		return
 	}
 	if c.Text == nil {
 		return
@@ -120,31 +127,45 @@ func (r *replay) add(u acpsdk.SessionUpdate) {
 type process struct {
 	sid   string // the hearth session
 	out   chan<- core.AgentEvent
-	conn  *acpsdk.ClientSideConnection
+	conn  conn
 	tp    transport
 	ready chan struct{} // closed once initialize and session/new are over, whether they worked or not
 
 	acpSID acpsdk.SessionId // the agent's session; set before ready closes, empty if the handshake failed
 
+	tools []map[string]any // what hearth's MCP server lists
+	cwd   string           // the session's folder; tool calls outside it always ask
+
 	mu       sync.Mutex
-	running  bool            // a turn's prompt is in flight, or about to be sent
-	held     []heldMessage   // sent mid-turn, to go out as prompts when the turn ends, oldest first
-	text     strings.Builder // the agent's text so far this message
-	startErr error           // why the handshake failed
-	replay   *replay         // set while session/load streams the history back; those updates are not live
+	mode     string                                      // permission mode, deciding which tool calls ask
+	perms    map[string]*pendingPerm                     // permission requests awaiting the user, by hearth's request id
+	mcpID    string                                      // the id of hearth's MCP server in this session; empty when the agent has no MCP-over-ACP
+	mcpConns map[acpsdk.UnstableMcpConnectionId]struct{} // MCP connections the agent opened to hearth's server
+	running  bool                                        // a turn's prompt is in flight, or about to be sent
+	held     []heldMessage                               // sent mid-turn, to go out as prompts when the turn ends, oldest first
+	text     strings.Builder                             // the agent's text so far this message
+	startErr error                                       // why the handshake failed
+	replay   *replay                                     // set while session/load streams the history back; those updates are not live
 }
 
 type heldMessage struct{ text, uuid string }
 
+// newProcess is the process of agent tp, with its connection open.
+func newProcess(tp transport) *process {
+	p := &process{tp: tp, perms: map[string]*pendingPerm{}, mcpConns: map[acpsdk.UnstableMcpConnectionId]struct{}{}}
+	p.conn = conn{acpsdk.NewConnection(client{p}.handle, tp.in, tp.out)}
+	return p
+}
+
 // Start spawns the agent; initialize and session/new run in the background and end in Initialized.
-// tools are not served yet.
+// tools is what hearth's MCP server lists, offered when the agent speaks MCP-over-ACP.
 func (l Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core.AgentEvent) (core.Agent, error) {
 	tp, err := l.open(s.Cwd)
 	if err != nil {
 		return nil, err
 	}
-	p := &process{sid: s.SessionID, out: out, tp: tp, ready: make(chan struct{})}
-	p.conn = acpsdk.NewClientSideConnection(client{p}, tp.in, tp.out)
+	p := newProcess(tp)
+	p.sid, p.out, p.ready, p.tools, p.cwd, p.mode = s.SessionID, out, make(chan struct{}), tools, s.Cwd, s.PermissionMode
 	go func() {
 		defer close(p.ready)
 		if err := p.handshake(s); err != nil {
@@ -190,13 +211,13 @@ func (p *process) initialize(ctx context.Context) (acpsdk.InitializeResponse, er
 }
 
 // load reloads the agent's session id and returns the conversation it replayed, which session/load
-// sends before it answers. mcpServers is empty until hearth's tools are served over ACP.
-func (p *process) load(ctx context.Context, id acpsdk.SessionId, cwd string) ([]core.Entry, error) {
+// sends before it answers.
+func (p *process) load(ctx context.Context, id acpsdk.SessionId, cwd string, servers []acpsdk.McpServer) ([]core.Entry, error) {
 	r := &replay{}
 	p.mu.Lock()
 	p.replay = r
 	p.mu.Unlock()
-	_, err := p.conn.LoadSession(ctx, acpsdk.LoadSessionRequest{SessionId: id, Cwd: cwd, McpServers: []acpsdk.McpServer{}})
+	_, err := p.conn.LoadSession(ctx, acpsdk.LoadSessionRequest{SessionId: id, Cwd: cwd, McpServers: servers})
 	p.mu.Lock()
 	p.replay = nil
 	p.mu.Unlock()
@@ -221,11 +242,12 @@ func (p *process) handshake(s *core.Session) error {
 		}
 		p.emit(ev)
 	}
+	servers := p.mcpServers(init)
 	var notice string // why a session the agent has seen before starts fresh
 	if s.CLISessionID != "" {
 		if !init.AgentCapabilities.LoadSession {
 			notice = "history was not restored: this agent can't reload a session yet, so this is a fresh conversation"
-		} else if _, err := p.load(ctx, acpsdk.SessionId(s.CLISessionID), s.Cwd); err != nil {
+		} else if _, err := p.load(ctx, acpsdk.SessionId(s.CLISessionID), s.Cwd, servers); err != nil {
 			notice = "history was not restored: " + err.Error() + ", so this is a fresh conversation"
 		} else {
 			// The replay is dropped: the session's entries already hold it, or EnsureLoaded loads it.
@@ -234,8 +256,7 @@ func (p *process) handshake(s *core.Session) error {
 		}
 	}
 	// No _meta.systemPrompt: hearth has no system-prompt text to append yet.
-	// mcpServers is empty until hearth's tools are served over ACP.
-	sess, err := p.conn.NewSession(ctx, acpsdk.NewSessionRequest{Cwd: s.Cwd, McpServers: []acpsdk.McpServer{}})
+	sess, err := p.conn.NewSession(ctx, acpsdk.NewSessionRequest{Cwd: s.Cwd, McpServers: servers})
 	if err != nil {
 		return fmt.Errorf("session/new: %s", failureText(err))
 	}
@@ -306,6 +327,7 @@ func (p *process) turn(text, uuid string) bool {
 		}
 	default:
 	}
+	p.cancelPerms() // the turn is over, so nobody is left to answer
 	// Prompt returns after every update sent before its response was handled, so the reply is whole.
 	p.mu.Lock()
 	msg := p.text.String()
@@ -340,6 +362,7 @@ func (p *process) Interrupt() string {
 		} else if err := p.conn.Cancel(context.Background(), acpsdk.CancelNotification{SessionId: p.acpSID}); err != nil {
 			r.Err = failureText(err)
 		}
+		p.cancelPerms() // ACP: a cancelled session answers its pending permission requests as cancelled
 		p.emit(r)
 	}()
 	return id
@@ -358,8 +381,11 @@ func (p *process) unsupported(what string) string {
 }
 
 func (p *process) CancelQueued(string) string { return p.unsupported("cancelling one queued message") }
-func (p *process) SetPermissionMode(string) string {
-	return p.unsupported("permission modes")
+func (p *process) SetPermissionMode(mode string) string {
+	p.mu.Lock()
+	p.mode = mode
+	p.mu.Unlock()
+	return p.reply(core.Reply{})
 }
 func (p *process) SetModel(string) string  { return p.unsupported("switching models") }
 func (p *process) SetEffort(string) string { return p.unsupported("setting an effort") }
@@ -369,72 +395,8 @@ func (p *process) GenerateTitle(string) string {
 }
 func (p *process) Rewind(string, bool) string { return p.unsupported("file rewind") }
 
-// Allow and Deny answer permission requests, which hearth does not raise yet.
-func (p *process) Allow(string, map[string]any, []any) error {
-	return errors.New("this agent does not support permission requests yet")
-}
-
-func (p *process) Deny(string, string) error {
-	return errors.New("this agent does not support permission requests yet")
-}
-
 // Close ends stdin so the agent exits cleanly; it is killed if it lingers.
 func (p *process) Close() {
 	p.tp.in.Close()
 	time.AfterFunc(3*time.Second, p.tp.kill)
-}
-
-// client is hearth as the agent sees it: it offers no files or terminals, and
-// answers nothing it hasn't built yet.
-type client struct{ p *process }
-
-var _ acpsdk.Client = client{}
-
-func (c client) SessionUpdate(_ context.Context, n acpsdk.SessionNotification) error {
-	c.p.mu.Lock()
-	r := c.p.replay
-	c.p.mu.Unlock()
-	if r != nil {
-		r.add(n.Update)
-		return nil
-	}
-	if m := n.Update.AgentMessageChunk; m != nil && m.Content.Text != nil {
-		c.p.mu.Lock()
-		c.p.text.WriteString(m.Content.Text.Text)
-		c.p.mu.Unlock()
-		c.p.emit(core.TextDelta{Text: m.Content.Text.Text})
-	}
-	return nil
-}
-
-func (client) RequestPermission(context.Context, acpsdk.RequestPermissionRequest) (acpsdk.RequestPermissionResponse, error) {
-	return acpsdk.RequestPermissionResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodSessionRequestPermission)
-}
-
-func (client) ReadTextFile(context.Context, acpsdk.ReadTextFileRequest) (acpsdk.ReadTextFileResponse, error) {
-	return acpsdk.ReadTextFileResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodFsReadTextFile)
-}
-
-func (client) WriteTextFile(context.Context, acpsdk.WriteTextFileRequest) (acpsdk.WriteTextFileResponse, error) {
-	return acpsdk.WriteTextFileResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodFsWriteTextFile)
-}
-
-func (client) CreateTerminal(context.Context, acpsdk.CreateTerminalRequest) (acpsdk.CreateTerminalResponse, error) {
-	return acpsdk.CreateTerminalResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodTerminalCreate)
-}
-
-func (client) KillTerminal(context.Context, acpsdk.KillTerminalRequest) (acpsdk.KillTerminalResponse, error) {
-	return acpsdk.KillTerminalResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodTerminalKill)
-}
-
-func (client) TerminalOutput(context.Context, acpsdk.TerminalOutputRequest) (acpsdk.TerminalOutputResponse, error) {
-	return acpsdk.TerminalOutputResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodTerminalOutput)
-}
-
-func (client) ReleaseTerminal(context.Context, acpsdk.ReleaseTerminalRequest) (acpsdk.ReleaseTerminalResponse, error) {
-	return acpsdk.ReleaseTerminalResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodTerminalRelease)
-}
-
-func (client) WaitForTerminalExit(context.Context, acpsdk.WaitForTerminalExitRequest) (acpsdk.WaitForTerminalExitResponse, error) {
-	return acpsdk.WaitForTerminalExitResponse{}, acpsdk.NewMethodNotFound(acpsdk.ClientMethodTerminalWaitForExit)
 }
