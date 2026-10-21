@@ -42,6 +42,9 @@ type transport struct {
 }
 
 func (l Launcher) open(cwd string) (transport, error) {
+	if !filepath.IsAbs(cwd) {
+		return transport{}, fmt.Errorf("session folder %q is not absolute; ACP needs an absolute cwd", cwd)
+	}
 	if l.spawn != nil {
 		return l.spawn(cwd)
 	}
@@ -61,11 +64,56 @@ func (l Launcher) open(cwd string) (transport, error) {
 	return transport{in: stdin, out: stdout, wait: cmd.Wait, kill: func() { cmd.Process.Kill() }}, nil
 }
 
-// Transcripts has no history to read until the agent can reload a session.
-type Transcripts struct{}
+// Transcripts reads a session's history by having a short-lived agent reload it.
+type Transcripts struct{ Launcher Launcher }
 
-func (Transcripts) Load(cwd, cliSessionID string) ([]core.Entry, error) {
-	return nil, errors.New("this agent's session history is not restored yet")
+// Load starts the agent, replays the session through session/load and stops the agent again.
+// It fails for an agent that can't reload a session.
+func (t Transcripts) Load(cwd, cliSessionID string) ([]core.Entry, error) {
+	tp, err := t.Launcher.open(cwd)
+	if err != nil {
+		return nil, err
+	}
+	p := &process{tp: tp}
+	p.conn = acpsdk.NewClientSideConnection(client{p}, tp.in, tp.out)
+	go func() { // reaps the process
+		<-p.conn.Done()
+		tp.wait()
+	}()
+	defer p.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	init, err := p.initialize(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !init.AgentCapabilities.LoadSession {
+		return nil, errors.New("this agent's session history is not restored yet")
+	}
+	return p.load(ctx, acpsdk.SessionId(cliSessionID), cwd)
+}
+
+// replay is a session's conversation as session/load streams it back.
+type replay struct{ entries []core.Entry }
+
+// add appends a message chunk, joining it to the entry before when that is the same speaker's.
+func (r *replay) add(u acpsdk.SessionUpdate) {
+	var kind string
+	var c acpsdk.ContentBlock
+	switch {
+	case u.UserMessageChunk != nil:
+		kind, c = "user", u.UserMessageChunk.Content
+	case u.AgentMessageChunk != nil:
+		kind, c = "assistant", u.AgentMessageChunk.Content
+	}
+	if c.Text == nil {
+		return
+	}
+	if n := len(r.entries); n > 0 && r.entries[n-1].Kind == kind {
+		r.entries[n-1].Text += c.Text.Text
+		return
+	}
+	r.entries = append(r.entries, core.Entry{Kind: kind, Text: c.Text.Text})
 }
 
 // process is one ACP agent. It translates ACP to core events and back.
@@ -83,6 +131,7 @@ type process struct {
 	held     []heldMessage   // sent mid-turn, to go out as prompts when the turn ends, oldest first
 	text     strings.Builder // the agent's text so far this message
 	startErr error           // why the handshake failed
+	replay   *replay         // set while session/load streams the history back; those updates are not live
 }
 
 type heldMessage struct{ text, uuid string }
@@ -90,9 +139,6 @@ type heldMessage struct{ text, uuid string }
 // Start spawns the agent; initialize and session/new run in the background and end in Initialized.
 // tools are not served yet.
 func (l Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core.AgentEvent) (core.Agent, error) {
-	if !filepath.IsAbs(s.Cwd) {
-		return nil, fmt.Errorf("session folder %q is not absolute; ACP needs an absolute cwd", s.Cwd)
-	}
 	tp, err := l.open(s.Cwd)
 	if err != nil {
 		return nil, err
@@ -129,18 +175,63 @@ func (l Launcher) Models(cwd string) ([]core.Model, error) { return nil, nil }
 
 func (p *process) emit(ev core.Event) { p.out <- core.AgentEvent{SessionID: p.sid, Event: ev} }
 
-func (p *process) handshake(s *core.Session) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func (p *process) initialize(ctx context.Context) (acpsdk.InitializeResponse, error) {
 	init, err := p.conn.Initialize(ctx, acpsdk.InitializeRequest{
 		ProtocolVersion: acpsdk.ProtocolVersionNumber,
 		ClientInfo:      &acpsdk.Implementation{Name: "hearth"},
 	})
 	if err != nil {
-		return fmt.Errorf("initialize: %s", failureText(err))
+		return init, fmt.Errorf("initialize: %s", failureText(err))
 	}
 	if init.ProtocolVersion != acpsdk.ProtocolVersionNumber {
-		return fmt.Errorf("initialize: agent speaks ACP version %d, hearth speaks %d", init.ProtocolVersion, acpsdk.ProtocolVersionNumber)
+		return init, fmt.Errorf("initialize: agent speaks ACP version %d, hearth speaks %d", init.ProtocolVersion, acpsdk.ProtocolVersionNumber)
+	}
+	return init, nil
+}
+
+// load reloads the agent's session id and returns the conversation it replayed, which session/load
+// sends before it answers. mcpServers is empty until hearth's tools are served over ACP.
+func (p *process) load(ctx context.Context, id acpsdk.SessionId, cwd string) ([]core.Entry, error) {
+	r := &replay{}
+	p.mu.Lock()
+	p.replay = r
+	p.mu.Unlock()
+	_, err := p.conn.LoadSession(ctx, acpsdk.LoadSessionRequest{SessionId: id, Cwd: cwd, McpServers: []acpsdk.McpServer{}})
+	p.mu.Lock()
+	p.replay = nil
+	p.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("session/load: %s", failureText(err))
+	}
+	return r.entries, nil
+}
+
+func (p *process) handshake(s *core.Session) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	init, err := p.initialize(ctx)
+	if err != nil {
+		return err
+	}
+	initialized := func(id acpsdk.SessionId) {
+		p.acpSID = id
+		ev := core.Initialized{CLISessionID: string(id)}
+		if init.AgentInfo != nil {
+			ev.Version = init.AgentInfo.Version
+		}
+		p.emit(ev)
+	}
+	var notice string // why a session the agent has seen before starts fresh
+	if s.CLISessionID != "" {
+		if !init.AgentCapabilities.LoadSession {
+			notice = "history was not restored: this agent can't reload a session yet, so this is a fresh conversation"
+		} else if _, err := p.load(ctx, acpsdk.SessionId(s.CLISessionID), s.Cwd); err != nil {
+			notice = "history was not restored: " + err.Error() + ", so this is a fresh conversation"
+		} else {
+			// The replay is dropped: the session's entries already hold it, or EnsureLoaded loads it.
+			initialized(acpsdk.SessionId(s.CLISessionID))
+			return nil
+		}
 	}
 	// No _meta.systemPrompt: hearth has no system-prompt text to append yet.
 	// mcpServers is empty until hearth's tools are served over ACP.
@@ -151,15 +242,9 @@ func (p *process) handshake(s *core.Session) error {
 	if sess.SessionId == "" {
 		return errors.New("session/new: the agent returned no sessionId")
 	}
-	p.acpSID = sess.SessionId
-	ev := core.Initialized{CLISessionID: string(sess.SessionId)}
-	if init.AgentInfo != nil {
-		ev.Version = init.AgentInfo.Version
-	}
-	p.emit(ev)
-	if s.CLISessionID != "" {
-		// shortcut: no session/load yet, so a relaunch is a new conversation; drop once the agent advertises loadSession.
-		p.emit(core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: "history was not restored: this agent can't reload a session yet, so this is a fresh conversation"}}})
+	initialized(sess.SessionId)
+	if notice != "" {
+		p.emit(core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: notice}}})
 	}
 	return nil
 }
@@ -306,6 +391,13 @@ type client struct{ p *process }
 var _ acpsdk.Client = client{}
 
 func (c client) SessionUpdate(_ context.Context, n acpsdk.SessionNotification) error {
+	c.p.mu.Lock()
+	r := c.p.replay
+	c.p.mu.Unlock()
+	if r != nil {
+		r.add(n.Update)
+		return nil
+	}
 	if m := n.Update.AgentMessageChunk; m != nil && m.Content.Text != nil {
 		c.p.mu.Lock()
 		c.p.text.WriteString(m.Content.Text.Text)

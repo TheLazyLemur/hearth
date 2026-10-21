@@ -22,16 +22,47 @@ type fakeAgent struct {
 	conn      *acpsdk.AgentSideConnection
 	onPrompt  func(ctx context.Context, text string) (acpsdk.PromptResponse, error)
 	newErr    error
-	cancelled chan struct{} // closed by session/cancel
-	exit      func()        // the agent process ends
+	canLoad   bool                                           // advertises loadSession
+	loadErr   error                                          // session/load fails with this
+	onLoad    func(ctx context.Context, id acpsdk.SessionId) // streams the history session/load replays
+	cancelled chan struct{}                                  // closed by session/cancel
+	exit      func()                                         // the agent process ends
 
-	mu      sync.Mutex
-	newReqs []acpsdk.NewSessionRequest
-	log     []string // "prompt:<text>" and "end:<text>", in order
+	mu       sync.Mutex
+	newReqs  []acpsdk.NewSessionRequest
+	loadReqs []acpsdk.LoadSessionRequest
+	log      []string // "prompt:<text>" and "end:<text>", in order
 }
 
 func (a *fakeAgent) Initialize(context.Context, acpsdk.InitializeRequest) (acpsdk.InitializeResponse, error) {
-	return acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber, AgentInfo: &acpsdk.Implementation{Name: "fake", Version: "9.9"}}, nil
+	return acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber, AgentInfo: &acpsdk.Implementation{Name: "fake", Version: "9.9"},
+		AgentCapabilities: acpsdk.AgentCapabilities{LoadSession: a.canLoad}}, nil
+}
+
+func (a *fakeAgent) LoadSession(ctx context.Context, r acpsdk.LoadSessionRequest) (acpsdk.LoadSessionResponse, error) {
+	a.mu.Lock()
+	a.loadReqs = append(a.loadReqs, r)
+	a.mu.Unlock()
+	if a.loadErr != nil {
+		return acpsdk.LoadSessionResponse{}, a.loadErr
+	}
+	if a.onLoad != nil {
+		a.onLoad(ctx, r.SessionId)
+	}
+	return acpsdk.LoadSessionResponse{}, nil
+}
+
+// replayed streams a history over session/update: "u:" chunks are the user's, the rest the agent's.
+func (a *fakeAgent) replayed(chunks ...string) func(context.Context, acpsdk.SessionId) {
+	return func(ctx context.Context, id acpsdk.SessionId) {
+		for _, c := range chunks {
+			u := acpsdk.UpdateAgentMessageText(c)
+			if t, ok := strings.CutPrefix(c, "u:"); ok {
+				u = acpsdk.UpdateUserMessageText(t)
+			}
+			a.conn.SessionUpdate(ctx, acpsdk.SessionNotification{SessionId: id, Update: u})
+		}
+	}
 }
 
 func (a *fakeAgent) NewSession(_ context.Context, r acpsdk.NewSessionRequest) (acpsdk.NewSessionResponse, error) {
@@ -100,8 +131,8 @@ func replies(a *fakeAgent, chunks ...string) func(context.Context, string) (acps
 	}
 }
 
-// start launches a Launcher over in-memory pipes to agent and returns the Agent and its events.
-func start(t *testing.T, agent *fakeAgent, s *core.Session) (core.Agent, chan core.AgentEvent) {
+// launcher is a Launcher whose process is in-memory pipes to agent.
+func launcher(t *testing.T, agent *fakeAgent) Launcher {
 	t.Helper()
 	toAgentR, toAgentW := io.Pipe()
 	fromAgentR, fromAgentW := io.Pipe()
@@ -109,9 +140,15 @@ func start(t *testing.T, agent *fakeAgent, s *core.Session) (core.Agent, chan co
 	agent.conn = acpsdk.NewAgentSideConnection(agent, fromAgentW, toAgentR)
 	agent.exit = func() { fromAgentW.Close(); toAgentR.Close() }
 	t.Cleanup(agent.exit)
-	l := Launcher{spawn: func(string) (transport, error) {
+	return Launcher{spawn: func(string) (transport, error) {
 		return transport{in: toAgentW, out: fromAgentR, wait: func() error { return nil }, kill: agent.exit}, nil
 	}}
+}
+
+// start launches a Launcher over in-memory pipes to agent and returns the Agent and its events.
+func start(t *testing.T, agent *fakeAgent, s *core.Session) (core.Agent, chan core.AgentEvent) {
+	t.Helper()
+	l := launcher(t, agent)
 	out := make(chan core.AgentEvent, 64)
 	ag, err := l.Start(s, nil, out)
 	if err != nil {
@@ -193,8 +230,97 @@ func TestRelaunchStartsFreshAndSaysHistoryWasNotRestored(t *testing.T) {
 	// ... a new agent session replaces the old id, and an info entry says the history was not restored
 	want := []core.Event{core.Initialized{Version: "9.9", CLISessionID: "acp-1"},
 		core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: "history was not restored: this agent can't reload a session yet, so this is a fresh conversation"}}}}
+	if !reflect.DeepEqual(got, want) || len(agent.loadReqs) != 0 {
+		t.Fatalf("got %#v session/load sent %d times", got, len(agent.loadReqs))
+	}
+}
+
+func TestRelaunchLoadsTheStoredSessionWithoutReemittingTheReplay(t *testing.T) {
+	// given
+	// ... an agent that can reload sessions and replays a two-message history
+	agent := &fakeAgent{canLoad: true}
+	agent.onLoad = agent.replayed("u:hi", "Hel", "lo")
+	agent.onPrompt = replies(agent, "ok")
+	s := session()
+	s.CLISessionID = "old"
+
+	// when
+	// ... the session is started again and then sent a message
+	ag, out := start(t, agent, s)
+	got := next(t, out)
+	if err := ag.SendUser("more", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	after := next(t, out)
+
+	// then
+	// ... session/load carried the stored id, cwd and no MCP servers, session/new was not sent,
+	// ... Initialized names the same id, and the first event after it is the new message, not the replay
+	req := agent.loadReqs[0]
+	wantReq := acpsdk.LoadSessionRequest{SessionId: "old", Cwd: "/work", McpServers: []acpsdk.McpServer{}}
+	if !reflect.DeepEqual(req, wantReq) || len(agent.newReqs) != 0 ||
+		got != (core.Initialized{Version: "9.9", CLISessionID: "old"}) || after != (core.Consumed{UUID: "u1"}) {
+		t.Fatalf("load %+v new %d got %#v then %#v", req, len(agent.newReqs), got, after)
+	}
+}
+
+func TestRelaunchFallsBackToAFreshSessionWhenLoadFails(t *testing.T) {
+	// given
+	// ... an agent that can reload sessions but doesn't know this one
+	agent := &fakeAgent{canLoad: true, loadErr: errors.New("unknown session old")}
+	s := session()
+	s.CLISessionID = "old"
+
+	// when
+	// ... the session is started again
+	_, out := start(t, agent, s)
+	got := events(t, out, 2)
+
+	// then
+	// ... a new agent session replaces the id, and an info entry carries the agent's error
+	want := []core.Event{core.Initialized{Version: "9.9", CLISessionID: "acp-1"},
+		core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: "history was not restored: session/load: unknown session old, so this is a fresh conversation"}}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestTranscriptsLoadBuildsEntriesFromTheReplayAndClosesTheAgent(t *testing.T) {
+	// given
+	// ... an agent that replays two exchanges, each reply in chunks
+	agent := &fakeAgent{canLoad: true}
+	agent.onLoad = agent.replayed("u:hi", "Hel", "lo", "u:and ", "u:again", "ok")
+
+	// when
+	// ... the history of a session is loaded
+	got, err := Transcripts{Launcher: launcher(t, agent)}.Load("/work", "old")
+
+	// then
+	// ... the entries are the messages in order with their chunks joined, the stored id was loaded and the agent's stdin is closed
+	want := []core.Entry{{Kind: "user", Text: "hi"}, {Kind: "assistant", Text: "Hello"}, {Kind: "user", Text: "and again"}, {Kind: "assistant", Text: "ok"}}
+	if err != nil || !reflect.DeepEqual(got, want) || agent.loadReqs[0].SessionId != "old" {
+		t.Fatalf("got %#v err %v load %+v", got, err, agent.loadReqs)
+	}
+	select {
+	case <-agent.conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent was not closed")
+	}
+}
+
+func TestTranscriptsLoadFailsForAnAgentThatCannotReload(t *testing.T) {
+	// given
+	// ... an agent that does not advertise loadSession
+	agent := &fakeAgent{}
+
+	// when
+	// ... the history of a session is loaded
+	got, err := Transcripts{Launcher: launcher(t, agent)}.Load("/work", "old")
+
+	// then
+	// ... it fails without sending session/load
+	if err == nil || got != nil || len(agent.loadReqs) != 0 {
+		t.Fatalf("got %#v err %v", got, err)
 	}
 }
 
