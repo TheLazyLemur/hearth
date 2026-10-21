@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"hearth/internal/acp"
 	"hearth/internal/cli"
 	"hearth/internal/core"
 	"hearth/internal/daemon"
@@ -122,6 +123,9 @@ func newApp(dir, home string) (*core.App, error) {
 			Launcher: pi.Launcher{Binary: "pi"},
 			Transcripts: pi.Transcripts{Dir: cmp.Or(os.Getenv("PI_CODING_AGENT_SESSION_DIR"),
 				filepath.Join(cmp.Or(os.Getenv("PI_CODING_AGENT_DIR"), filepath.Join(home, ".pi", "agent")), "sessions"))}},
+		"grimalkin": {Label: "grimalkin", Tag: "gr",
+			Launcher:    acp.Launcher{Binary: cmp.Or(os.Getenv("HEARTH_GRIMALKIN_CLI"), "grimalkin"), Args: []string{"acp"}},
+			Transcripts: acp.Transcripts{}},
 	}, git.Worktrees{}, shell.Shells{})
 	if err != nil {
 		return nil, fmt.Errorf("load sessions: %w", err)
