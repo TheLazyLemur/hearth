@@ -33,8 +33,31 @@ func (c conn) LoadSession(ctx context.Context, r acpsdk.LoadSessionRequest) (acp
 	return acpsdk.SendRequest[acpsdk.LoadSessionResponse](c.Connection, ctx, acpsdk.AgentMethodSessionLoad, r)
 }
 
+func (c conn) SetConfigOption(ctx context.Context, r acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
+	return acpsdk.SendRequest[acpsdk.SetSessionConfigOptionResponse](c.Connection, ctx, acpsdk.AgentMethodSessionSetConfigOption, r)
+}
+
+func (c conn) CloseSession(ctx context.Context, r acpsdk.CloseSessionRequest) (acpsdk.CloseSessionResponse, error) {
+	return acpsdk.SendRequest[acpsdk.CloseSessionResponse](c.Connection, ctx, acpsdk.AgentMethodSessionClose, r)
+}
+
 func (c conn) Prompt(ctx context.Context, r acpsdk.PromptRequest) (acpsdk.PromptResponse, error) {
 	return acpsdk.SendRequest[acpsdk.PromptResponse](c.Connection, ctx, acpsdk.AgentMethodSessionPrompt, r)
+}
+
+// steerRequest is _session/steering, the extension claude-agent-acp and codex-acp share for a message into a running turn.
+type steerRequest struct {
+	SessionId acpsdk.SessionId      `json:"sessionId"`
+	Prompt    []acpsdk.ContentBlock `json:"prompt"`
+	Meta      map[string]any        `json:"_meta"`
+}
+
+type steerResponse struct {
+	Outcome string `json:"outcome"` // injected, startedNewTurn, promptRequired or failed
+}
+
+func (c conn) Steer(ctx context.Context, r steerRequest) (steerResponse, error) {
+	return acpsdk.SendRequest[steerResponse](c.Connection, ctx, "_session/steering", r)
 }
 
 func (c conn) Cancel(ctx context.Context, n acpsdk.CancelNotification) error {

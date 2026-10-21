@@ -41,25 +41,53 @@ func (c agentConn) McpMessage(ctx context.Context, id acpsdk.UnstableMcpConnecti
 
 // fakeAgent is an ACP agent on the agent side of a connection. onPrompt scripts each turn.
 type fakeAgent struct {
-	conn      agentConn
-	mcp       bool // advertises mcpCapabilities.acp
-	onPrompt  func(ctx context.Context, text string) (acpsdk.PromptResponse, error)
-	newErr    error
-	canLoad   bool                                           // advertises loadSession
-	loadErr   error                                          // session/load fails with this
-	onLoad    func(ctx context.Context, id acpsdk.SessionId) // streams the history session/load replays
-	cancelled chan struct{}                                  // closed by session/cancel
-	exit      func()                                         // the agent process ends
+	conn        agentConn
+	mcp         bool // advertises mcpCapabilities.acp
+	onPrompt    func(ctx context.Context, text string) (acpsdk.PromptResponse, error)
+	newErr      error
+	canLoad     bool                                           // advertises loadSession
+	loadErr     error                                          // session/load fails with this
+	onLoad      func(ctx context.Context, id acpsdk.SessionId) // streams the history session/load replays
+	cancelled   chan struct{}                                  // closed by session/cancel
+	exit        func()                                         // the agent process ends
+	steering    bool                                           // advertises _meta.steering.supported
+	onSteer     func(text string) (string, error)              // answers each _session/steering with an outcome
+	canClose    bool                                           // advertises sessionCapabilities.close
+	models      []fakeModel                                    // the model and thought_level options it exposes; none when empty
+	metaEfforts bool                                           // each model choice carries its efforts in _meta.efforts
+	byID        bool                                           // names no option categories, only the ids model and thought_level
+	setErr      map[string]error                               // session/set_config_option fails for these values
 
 	mu       sync.Mutex
 	newReqs  []acpsdk.NewSessionRequest
 	loadReqs []acpsdk.LoadSessionRequest
+	steers   []steerRequest
+	model    string                                 // the model it runs, the first of models until one is set
+	effort   string                                 // the thought_level it is on, the model's first until one is set
+	sets     []acpsdk.SetSessionConfigOptionValueId // session/set_config_option calls, in order
+	closed   []acpsdk.SessionId
 	log      []string // "prompt:<text>" and "end:<text>", in order
 }
 
 func (a *fakeAgent) Initialize(context.Context, acpsdk.InitializeRequest) (acpsdk.InitializeResponse, error) {
-	return acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber, AgentInfo: &acpsdk.Implementation{Name: "fake", Version: "9.9"},
-		AgentCapabilities: acpsdk.AgentCapabilities{LoadSession: a.canLoad, McpCapabilities: acpsdk.McpCapabilities{Acp: a.mcp}}}, nil
+	r := acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber, AgentInfo: &acpsdk.Implementation{Name: "fake", Version: "9.9"},
+		AgentCapabilities: acpsdk.AgentCapabilities{LoadSession: a.canLoad, McpCapabilities: acpsdk.McpCapabilities{Acp: a.mcp}}}
+	if a.canClose {
+		r.AgentCapabilities.SessionCapabilities.Close = &acpsdk.SessionCloseCapabilities{}
+	}
+	if a.steering {
+		r.Meta = map[string]any{"steering": map[string]any{"supported": true}}
+	}
+	return r, nil
+}
+
+func (a *fakeAgent) Steer(_ context.Context, r steerRequest) (steerResponse, error) {
+	text := r.Prompt[0].Text.Text
+	a.mu.Lock()
+	a.steers = append(a.steers, r)
+	a.mu.Unlock()
+	outcome, err := a.onSteer(text)
+	return steerResponse{Outcome: outcome}, err
 }
 
 func (a *fakeAgent) handle(ctx context.Context, method string, raw json.RawMessage) (any, *acpsdk.RequestError) {
@@ -72,6 +100,17 @@ func (a *fakeAgent) handle(ctx context.Context, method string, raw json.RawMessa
 		return serve(raw, func(r acpsdk.LoadSessionRequest) (any, error) { return a.LoadSession(ctx, r) })
 	case acpsdk.AgentMethodSessionPrompt:
 		return serve(raw, func(r acpsdk.PromptRequest) (any, error) { return a.Prompt(ctx, r) })
+	case acpsdk.AgentMethodSessionSetConfigOption:
+		return serve(raw, func(r acpsdk.SetSessionConfigOptionRequest) (any, error) { return a.SetConfigOption(r) })
+	case acpsdk.AgentMethodSessionClose:
+		return serve(raw, func(r acpsdk.CloseSessionRequest) (any, error) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.closed = append(a.closed, r.SessionId)
+			return acpsdk.CloseSessionResponse{}, nil
+		})
+	case "_session/steering":
+		return serve(raw, func(r steerRequest) (any, error) { return a.Steer(ctx, r) })
 	case acpsdk.AgentMethodSessionCancel:
 		return serve(raw, func(r acpsdk.CancelNotification) (any, error) { return nil, a.Cancel(ctx, r) })
 	}
@@ -88,7 +127,95 @@ func (a *fakeAgent) LoadSession(ctx context.Context, r acpsdk.LoadSessionRequest
 	if a.onLoad != nil {
 		a.onLoad(ctx, r.SessionId)
 	}
-	return acpsdk.LoadSessionResponse{}, nil
+	return acpsdk.LoadSessionResponse{ConfigOptions: a.options()}, nil
+}
+
+// fakeModel is a model the fake agent offers and the thought_level values it accepts.
+type fakeModel struct {
+	id      string
+	efforts []string
+}
+
+// options is the config options as the agent has them now. The thought_level values are the current model's.
+func (a *fakeAgent) options() []acpsdk.SessionConfigOption {
+	if len(a.models) == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.model == "" {
+		a.model, a.effort = a.models[0].id, a.models[0].efforts[0]
+	}
+	var ids []string
+	var efforts []string
+	for _, m := range a.models {
+		ids = append(ids, m.id)
+		if m.id == a.model {
+			efforts = m.efforts
+		}
+	}
+	modelID, effortID := "m", "t"
+	modelCat, effortCat := acpsdk.SessionConfigOptionCategoryModel, acpsdk.SessionConfigOptionCategoryThoughtLevel
+	if a.byID {
+		modelID, effortID = "model", "thought_level"
+	}
+	model := fakeSelect(modelID, a.model, ids)
+	if a.metaEfforts {
+		vs := *model.Select.Options.Ungrouped
+		for i, m := range a.models {
+			listed := []any{}
+			for _, e := range m.efforts {
+				listed = append(listed, e)
+			}
+			vs[i].Meta = map[string]any{"efforts": listed}
+		}
+	}
+	effort := fakeSelect(effortID, a.effort, efforts)
+	if !a.byID {
+		model.Select.Category, effort.Select.Category = &modelCat, &effortCat
+	}
+	return []acpsdk.SessionConfigOption{model, effort}
+}
+
+func fakeSelect(id, current string, values []string) acpsdk.SessionConfigOption {
+	var vs acpsdk.SessionConfigSelectOptionsUngrouped
+	for _, v := range values {
+		d := v + " description"
+		vs = append(vs, acpsdk.SessionConfigSelectOption{Name: v + " name", Value: acpsdk.SessionConfigValueId(v), Description: &d})
+	}
+	o := acpsdk.NewSessionConfigOptionSelect(acpsdk.SessionConfigValueId(current), acpsdk.SessionConfigSelectOptions{Ungrouped: &vs})
+	o.Select.Id, o.Select.Name = acpsdk.SessionConfigId(id), id
+	return o
+}
+
+// SetConfigOption switches the model, which resets the effort to the new model's first, or sets the effort.
+func (a *fakeAgent) SetConfigOption(r acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
+	a.options() // fixes the starting state
+	a.mu.Lock()
+	a.sets = append(a.sets, *r.ValueId)
+	err := a.setErr[string(r.ValueId.Value)]
+	if err == nil {
+		switch r.ValueId.ConfigId {
+		case "m", "model":
+			for _, m := range a.models {
+				if string(r.ValueId.Value) == m.id {
+					a.model, a.effort = m.id, m.efforts[0]
+				}
+			}
+		default:
+			err = fmt.Errorf("%q is not a thought_level of %s", r.ValueId.Value, a.model)
+			for _, m := range a.models {
+				if m.id == a.model && slices.Contains(m.efforts, string(r.ValueId.Value)) {
+					a.effort, err = string(r.ValueId.Value), nil
+				}
+			}
+		}
+	}
+	a.mu.Unlock()
+	if err != nil {
+		return acpsdk.SetSessionConfigOptionResponse{}, err
+	}
+	return acpsdk.SetSessionConfigOptionResponse{ConfigOptions: a.options()}, nil
 }
 
 // replayed streams a history over session/update: "u:" chunks are the user's, the rest the agent's.
@@ -106,12 +233,13 @@ func (a *fakeAgent) replayed(chunks ...string) func(context.Context, acpsdk.Sess
 
 func (a *fakeAgent) NewSession(_ context.Context, r acpsdk.NewSessionRequest) (acpsdk.NewSessionResponse, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.newReqs = append(a.newReqs, r)
+	n := len(a.newReqs)
+	a.mu.Unlock()
 	if a.newErr != nil {
 		return acpsdk.NewSessionResponse{}, a.newErr
 	}
-	return acpsdk.NewSessionResponse{SessionId: acpsdk.SessionId(fmt.Sprintf("acp-%d", len(a.newReqs)))}, nil
+	return acpsdk.NewSessionResponse{SessionId: acpsdk.SessionId(fmt.Sprintf("acp-%d", n)), ConfigOptions: a.options()}, nil
 }
 
 func (a *fakeAgent) Prompt(ctx context.Context, r acpsdk.PromptRequest) (acpsdk.PromptResponse, error) {
@@ -397,6 +525,151 @@ func TestMessageDuringATurnIsHeldAndSentWhenTheTurnEnds(t *testing.T) {
 	}
 }
 
+// blockedFirst is a turn on "first" that ends only when released; other prompts end at once.
+func blockedFirst(release <-chan struct{}) func(context.Context, string) (acpsdk.PromptResponse, error) {
+	return func(_ context.Context, text string) (acpsdk.PromptResponse, error) {
+		if text == "first" {
+			<-release
+		}
+		return acpsdk.PromptResponse{StopReason: acpsdk.StopReasonEndTurn}, nil
+	}
+}
+
+// steered is a started steering agent whose "first" turn runs until release is closed, with first
+// already consumed. It answers each steer as onSteer says.
+func steered(t *testing.T, release <-chan struct{}, onSteer func(string) (string, error)) (*fakeAgent, core.Agent, chan core.AgentEvent) {
+	t.Helper()
+	agent := &fakeAgent{steering: true, onSteer: onSteer, onPrompt: blockedFirst(release)}
+	ag, out := started(t, agent)
+	if err := ag.SendUser("first", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	next(t, out)
+	return agent, ag, out
+}
+
+func always(outcome string, err error) func(string) (string, error) {
+	return func(string) (string, error) { return outcome, err }
+}
+
+func TestMessageDuringATurnSteersAndIsConsumedWhenInjected(t *testing.T) {
+	// given
+	// ... a turn in flight on an agent that supports steering and injects
+	release := make(chan struct{})
+	agent, ag, out := steered(t, release, always("injected", nil))
+
+	// when
+	// ... a second message is sent mid-turn
+	if err := ag.SendUser("second", "u2"); err != nil {
+		t.Fatal(err)
+	}
+	got := next(t, out)
+
+	// then
+	// ... it is consumed before the turn ends, the agent got _session/steering with the text and the idle opt-in, and no prompt for it
+	req := agent.steers[0]
+	wantMeta := map[string]any{"steering": map[string]any{"idleBehavior": "promptRequired"}}
+	if got != (core.Consumed{UUID: "u2"}) || req.SessionId != "acp-1" || req.Prompt[0].Text.Text != "second" || !reflect.DeepEqual(req.Meta, wantMeta) ||
+		!slices.Equal(agent.log, []string{"prompt:first"}) {
+		t.Fatalf("got %#v steer %+v agent saw %v", got, req, agent.log)
+	}
+	close(release)
+	if end := next(t, out); end != (core.TurnEnded{OK: true}) {
+		t.Fatalf("got %#v", end)
+	}
+}
+
+func TestSteerThatCannotInjectFallsBackToTheNextPrompt(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome string
+		err     error
+	}{
+		{"promptRequired", "promptRequired", nil},
+		{"failed", "failed", nil},
+		{"error", "", errors.New("malformed")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// given
+			// ... a turn in flight on a steering agent that refuses the steer
+			release := make(chan struct{})
+			agent, ag, out := steered(t, release, always(c.outcome, c.err))
+
+			// when
+			// ... a second message is sent mid-turn, and the turn then ends
+			if err := ag.SendUser("second", "u2"); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(50 * time.Millisecond) // the steer has been answered by now
+			close(release)
+			got := events(t, out, 3)
+
+			// then
+			// ... the message is consumed only when it is sent as the next prompt, after the first turn ends
+			want := []core.Event{core.TurnEnded{OK: true}, core.Consumed{UUID: "u2"}, core.TurnEnded{OK: true}}
+			wantLog := []string{"prompt:first", "end:first", "prompt:second", "end:second"}
+			if !reflect.DeepEqual(got, want) || !slices.Equal(agent.log, wantLog) || len(agent.steers) != 1 {
+				t.Fatalf("got %#v agent saw %v steers %d", got, agent.log, len(agent.steers))
+			}
+		})
+	}
+}
+
+func TestSteerThatStartedATurnIsConsumedAndNotPromptedAgain(t *testing.T) {
+	// given
+	// ... a turn in flight on an agent that starts its own turn for a steer
+	release := make(chan struct{})
+	agent, ag, out := steered(t, release, always("startedNewTurn", nil))
+
+	// when
+	// ... a second message is sent mid-turn, and the turn then ends
+	if err := ag.SendUser("second", "u2"); err != nil {
+		t.Fatal(err)
+	}
+	got := []core.Event{next(t, out)}
+	close(release)
+	got = append(got, next(t, out))
+
+	// then
+	// ... it is consumed at once, and no prompt is ever sent for it
+	want := []core.Event{core.Consumed{UUID: "u2"}, core.TurnEnded{OK: true}}
+	if !reflect.DeepEqual(got, want) || !slices.Equal(agent.log, []string{"prompt:first", "end:first"}) {
+		t.Fatalf("got %#v agent saw %v", got, agent.log)
+	}
+}
+
+func TestMessagesAfterAFallbackAreHeldInOrder(t *testing.T) {
+	// given
+	// ... a turn in flight on a steering agent that refuses to steer "second" but would inject "third"
+	release := make(chan struct{})
+	agent, ag, out := steered(t, release, func(text string) (string, error) {
+		if text == "second" {
+			return "promptRequired", nil
+		}
+		return "injected", nil
+	})
+
+	// when
+	// ... "second" then "third" are sent mid-turn, and the turn then ends
+	for _, m := range []heldMessage{{"second", "u2"}, {"third", "u3"}} {
+		if err := ag.SendUser(m.text, m.uuid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // both have been placed by now
+	close(release)
+	got := events(t, out, 5)
+
+	// then
+	// ... both go out as prompts in order, "third" was never steered, so it can't overtake "second"
+	want := []core.Event{core.TurnEnded{OK: true}, core.Consumed{UUID: "u2"}, core.TurnEnded{OK: true}, core.Consumed{UUID: "u3"}, core.TurnEnded{OK: true}}
+	wantLog := []string{"prompt:first", "end:first", "prompt:second", "end:second", "prompt:third", "end:third"}
+	if !reflect.DeepEqual(got, want) || !slices.Equal(agent.log, wantLog) || len(agent.steers) != 1 {
+		t.Fatalf("got %#v agent saw %v steers %d", got, agent.log, len(agent.steers))
+	}
+}
+
 func TestInterruptCancelsTheTurnAndItEndsInterrupted(t *testing.T) {
 	// given
 	// ... a turn that runs until the agent is cancelled, then stops as cancelled
@@ -515,5 +788,238 @@ func TestUnsupportedRequestsReplyWithAnError(t *testing.T) {
 				t.Fatalf("got %#v want %#v", got, want)
 			}
 		})
+	}
+}
+
+// twoModels is an agent exposing two models whose thought_level lists differ.
+func twoModels() *fakeAgent {
+	return &fakeAgent{models: []fakeModel{{"p/fast", []string{"low", "high"}}, {"p/deep", []string{"low", "medium", "max"}}}}
+}
+
+func set(config, value string) acpsdk.SetSessionConfigOptionValueId {
+	return acpsdk.SetSessionConfigOptionValueId{ConfigId: acpsdk.SessionConfigId(config), Value: acpsdk.SessionConfigValueId(value), SessionId: "acp-1"}
+}
+
+func TestModelsListsEachModelWithItsEffortsAndClosesTheSession(t *testing.T) {
+	// given
+	// ... an agent with two models whose thought_level lists differ, which can close sessions
+	agent := twoModels()
+	agent.canClose = true
+
+	// when
+	// ... the launcher lists its models
+	got, err := launcher(t, agent).Models("/work")
+
+	// then
+	// ... each model carries its name, description and own efforts, and the throwaway session was closed
+	want := []core.Model{
+		{ID: "p/fast", Name: "p/fast name", Description: "p/fast description", Efforts: []string{"low", "high"}},
+		{ID: "p/deep", Name: "p/deep name", Description: "p/deep description", Efforts: []string{"low", "medium", "max"}},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(agent.closed, []acpsdk.SessionId{"acp-1"}) {
+		t.Fatalf("got %#v err %v closed %v", got, err, agent.closed)
+	}
+}
+
+func TestModelsReadsEffortsFromTheModelChoicesWithoutSwitching(t *testing.T) {
+	// given
+	// ... an agent whose model choices carry _meta.efforts, one of them empty
+	agent := twoModels()
+	agent.models = append(agent.models, fakeModel{id: "p/plain"})
+	agent.metaEfforts = true
+
+	// when
+	// ... the launcher lists its models
+	got, err := launcher(t, agent).Models("/work")
+
+	// then
+	// ... each model has the efforts it declared, the empty one has none, and no set_config_option was sent
+	want := []core.Model{
+		{ID: "p/fast", Name: "p/fast name", Description: "p/fast description", Efforts: []string{"low", "high"}},
+		{ID: "p/deep", Name: "p/deep name", Description: "p/deep description", Efforts: []string{"low", "medium", "max"}},
+		{ID: "p/plain", Name: "p/plain name", Description: "p/plain description"},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) || len(agent.sets) != 0 {
+		t.Fatalf("got %#v err %v sets %v", got, err, agent.sets)
+	}
+}
+
+func TestModelsListsAModelTheAgentRefusesWithoutEfforts(t *testing.T) {
+	// given
+	// ... an agent that fails to switch to its second model, as when a provider's key command fails
+	agent := twoModels()
+	agent.setErr = map[string]error{"p/deep": errors.New("key command failed")}
+
+	// when
+	// ... the launcher lists its models
+	got, err := launcher(t, agent).Models("/work")
+
+	// then
+	// ... both are listed, the second without efforts
+	want := []core.Model{
+		{ID: "p/fast", Name: "p/fast name", Description: "p/fast description", Efforts: []string{"low", "high"}},
+		{ID: "p/deep", Name: "p/deep name", Description: "p/deep description"},
+	}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v err %v", got, err)
+	}
+}
+
+func TestModelsIsEmptyForAnAgentWithoutConfigOptions(t *testing.T) {
+	// given
+	// ... an agent that exposes no config options
+	agent := &fakeAgent{}
+
+	// when
+	// ... the launcher lists its models
+	got, err := launcher(t, agent).Models("/work")
+
+	// then
+	// ... the list is empty and there is no error
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %#v err %v", got, err)
+	}
+}
+
+func TestStartReportsTheModelTheAgentRuns(t *testing.T) {
+	// given
+	// ... an agent on its first model and a session with no model of its own
+	agent := twoModels()
+
+	// when
+	// ... the session starts
+	_, out := start(t, agent, session())
+	got := next(t, out)
+
+	// then
+	// ... Initialized names that model and nothing was set
+	if want := (core.Initialized{Version: "9.9", CLISessionID: "acp-1", Model: "p/fast"}); got != want || len(agent.sets) != 0 {
+		t.Fatalf("got %#v sets %v", got, agent.sets)
+	}
+}
+
+func TestStartAppliesTheSessionsModelThenEffortBeforeTheFirstPrompt(t *testing.T) {
+	// given
+	// ... a session that recorded model p/deep and effort max, on an agent that starts on p/fast
+	agent := twoModels()
+	agent.onPrompt = replies(agent, "ok")
+	s := session()
+	s.Model, s.Effort = "p/deep", "max"
+
+	// when
+	// ... it starts and is sent a message
+	ag, out := start(t, agent, s)
+	got := next(t, out)
+	ag.SendUser("hi", "u1")
+	next(t, out)
+
+	// then
+	// ... the model was set before the effort (max only exists on p/deep), both before the prompt, and Initialized names p/deep
+	want := []acpsdk.SetSessionConfigOptionValueId{set("m", "p/deep"), set("t", "max")}
+	if wantEv := (core.Initialized{Version: "9.9", CLISessionID: "acp-1", Model: "p/deep"}); got != wantEv ||
+		!reflect.DeepEqual(agent.sets, want) {
+		t.Fatalf("got %#v sets %v", got, agent.sets)
+	}
+}
+
+func TestStartFindsOptionsByIDWhenTheAgentNamesNoCategories(t *testing.T) {
+	// given
+	// ... an agent whose options carry the ids model and thought_level and no categories
+	agent := twoModels()
+	agent.byID = true
+	s := session()
+	s.Model = "p/deep"
+
+	// when
+	// ... a session recording p/deep starts
+	_, out := start(t, agent, s)
+	next(t, out)
+
+	// then
+	// ... the model option was set by its id
+	if want := []acpsdk.SetSessionConfigOptionValueId{set("model", "p/deep")}; !reflect.DeepEqual(agent.sets, want) {
+		t.Fatalf("sets %v", agent.sets)
+	}
+}
+
+func TestStartContinuesWithANoticeWhenTheModelCannotBeSet(t *testing.T) {
+	// given
+	// ... an agent that refuses p/deep, and a session recording p/deep with effort high
+	agent := twoModels()
+	agent.setErr = map[string]error{"p/deep": errors.New("key command failed")}
+	s := session()
+	s.Model, s.Effort = "p/deep", "high"
+
+	// when
+	// ... it starts
+	_, out := start(t, agent, s)
+	got := events(t, out, 2)
+
+	// then
+	// ... Initialized names the model the agent kept, an info entry gives the agent's error, and the effort was still applied
+	want := []core.Event{core.Initialized{Version: "9.9", CLISessionID: "acp-1", Model: "p/fast"},
+		core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: `model "p/deep" was not applied: key command failed; the agent stays on its current model`}}}}
+	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(agent.sets, []acpsdk.SetSessionConfigOptionValueId{set("m", "p/deep"), set("t", "high")}) {
+		t.Fatalf("got %#v sets %v", got, agent.sets)
+	}
+}
+
+func TestResumedSessionAppliesTheSessionsModel(t *testing.T) {
+	// given
+	// ... an agent that reloads sessions, and a stored session recording p/deep
+	agent := twoModels()
+	agent.canLoad = true
+	s := session()
+	s.CLISessionID, s.Model = "old", "p/deep"
+
+	// when
+	// ... it is started again
+	_, out := start(t, agent, s)
+	got := next(t, out)
+
+	// then
+	// ... the model was set on the loaded session, and Initialized names it
+	if want := (core.Initialized{Version: "9.9", CLISessionID: "old", Model: "p/deep"}); got != want || len(agent.sets) != 1 {
+		t.Fatalf("got %#v sets %v", got, agent.sets)
+	}
+}
+
+func TestSetModelThenSetEffortSendConfigOptionsAndReplyOK(t *testing.T) {
+	// given
+	// ... a started agent on p/fast
+	agent := twoModels()
+	ag, out := started(t, agent)
+
+	// when
+	// ... the model is switched and then an effort only the new model has is set
+	modelID := ag.SetModel("p/deep")
+	modelReply := next(t, out)
+	effortID := ag.SetEffort("max")
+	effortReply := next(t, out)
+
+	// then
+	// ... both reach the agent as set_config_option and each Reply is a success; max would have been refused on p/fast
+	want := []acpsdk.SetSessionConfigOptionValueId{set("m", "p/deep"), set("t", "max")}
+	if modelReply != (core.Reply{RequestID: modelID}) || effortReply != (core.Reply{RequestID: effortID}) || !reflect.DeepEqual(agent.sets, want) {
+		t.Fatalf("replies %#v %#v sets %v", modelReply, effortReply, agent.sets)
+	}
+}
+
+func TestSetModelRepliesWithTheAgentsError(t *testing.T) {
+	// given
+	// ... a started agent that fails switching to p/deep
+	agent := twoModels()
+	agent.setErr = map[string]error{"p/deep": errors.New("key command failed")}
+	ag, out := started(t, agent)
+
+	// when
+	// ... the model is switched
+	id := ag.SetModel("p/deep")
+	got := next(t, out)
+
+	// then
+	// ... the Reply carries the agent's error
+	if want := (core.Reply{RequestID: id, Err: "key command failed"}); got != want {
+		t.Fatalf("got %#v", got)
 	}
 }

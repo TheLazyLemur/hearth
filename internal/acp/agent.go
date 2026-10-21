@@ -26,7 +26,9 @@ var (
 )
 
 // Launcher starts an ACP agent: Binary with Args, speaking ACP on stdio.
-// Model and effort changes, renaming, titles, rewinding and cancelling one queued message reply with an error so far.
+// A message sent mid-turn steers the turn when the agent advertises _meta.steering.supported, and otherwise waits for the turn to end.
+// A model or effort change goes through the agent's model and thought_level config options.
+// Renaming, titles, rewinding and cancelling one queued message reply with an error so far.
 type Launcher struct {
 	Binary string
 	Args   []string
@@ -89,7 +91,8 @@ func (t Transcripts) Load(cwd, cliSessionID string) ([]core.Entry, error) {
 	if !init.AgentCapabilities.LoadSession {
 		return nil, errors.New("this agent's session history is not restored yet")
 	}
-	return p.load(ctx, acpsdk.SessionId(cliSessionID), cwd, []acpsdk.McpServer{}) // it runs no turn, so it needs no tools
+	entries, _, err := p.load(ctx, acpsdk.SessionId(cliSessionID), cwd, []acpsdk.McpServer{}) // it runs no turn, so it needs no tools
+	return entries, err
 }
 
 // replay is a session's conversation as session/load streams it back.
@@ -131,18 +134,24 @@ type process struct {
 	tp    transport
 	ready chan struct{} // closed once initialize and session/new are over, whether they worked or not
 
-	acpSID acpsdk.SessionId // the agent's session; set before ready closes, empty if the handshake failed
+	acpSID   acpsdk.SessionId // the agent's session; set before ready closes, empty if the handshake failed
+	steering bool             // the agent advertised _meta.steering.supported; set before ready closes
 
 	tools []map[string]any // what hearth's MCP server lists
 	cwd   string           // the session's folder; tool calls outside it always ask
 
+	cfg sync.Mutex // one set_config_option at a time, see setConfig
+
 	mu       sync.Mutex
+	opts     []acpsdk.SessionConfigOption                // the agent's config options as of its last answer
 	mode     string                                      // permission mode, deciding which tool calls ask
 	perms    map[string]*pendingPerm                     // permission requests awaiting the user, by hearth's request id
 	mcpID    string                                      // the id of hearth's MCP server in this session; empty when the agent has no MCP-over-ACP
 	mcpConns map[acpsdk.UnstableMcpConnectionId]struct{} // MCP connections the agent opened to hearth's server
 	running  bool                                        // a turn's prompt is in flight, or about to be sent
-	held     []heldMessage                               // sent mid-turn, to go out as prompts when the turn ends, oldest first
+	held     []heldMessage                               // sent mid-turn and not steered, to go out as prompts when the turn ends, oldest first
+	steers   int                                         // mid-turn messages still waiting for their steer to be answered
+	steerEnd chan struct{}                               // closed when the newest of those is done, so the next steers after it
 	text     strings.Builder                             // the agent's text so far this message
 	startErr error                                       // why the handshake failed
 	replay   *replay                                     // set while session/load streams the history back; those updates are not live
@@ -191,9 +200,6 @@ func (l Launcher) Start(s *core.Session, tools []map[string]any, out chan<- core
 	return p, nil
 }
 
-// Models lists none until the agent's model options are read (a later slice); hearth tolerates an empty list.
-func (l Launcher) Models(cwd string) ([]core.Model, error) { return nil, nil }
-
 func (p *process) emit(ev core.Event) { p.out <- core.AgentEvent{SessionID: p.sid, Event: ev} }
 
 func (p *process) initialize(ctx context.Context) (acpsdk.InitializeResponse, error) {
@@ -211,20 +217,20 @@ func (p *process) initialize(ctx context.Context) (acpsdk.InitializeResponse, er
 }
 
 // load reloads the agent's session id and returns the conversation it replayed, which session/load
-// sends before it answers.
-func (p *process) load(ctx context.Context, id acpsdk.SessionId, cwd string, servers []acpsdk.McpServer) ([]core.Entry, error) {
+// sends before it answers, and the config options it answered with.
+func (p *process) load(ctx context.Context, id acpsdk.SessionId, cwd string, servers []acpsdk.McpServer) ([]core.Entry, []acpsdk.SessionConfigOption, error) {
 	r := &replay{}
 	p.mu.Lock()
 	p.replay = r
 	p.mu.Unlock()
-	_, err := p.conn.LoadSession(ctx, acpsdk.LoadSessionRequest{SessionId: id, Cwd: cwd, McpServers: servers})
+	resp, err := p.conn.LoadSession(ctx, acpsdk.LoadSessionRequest{SessionId: id, Cwd: cwd, McpServers: servers})
 	p.mu.Lock()
 	p.replay = nil
 	p.mu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("session/load: %s", failureText(err))
+		return nil, nil, fmt.Errorf("session/load: %s", failureText(err))
 	}
-	return r.entries, nil
+	return r.entries, resp.ConfigOptions, nil
 }
 
 func (p *process) handshake(s *core.Session) error {
@@ -234,24 +240,34 @@ func (p *process) handshake(s *core.Session) error {
 	if err != nil {
 		return err
 	}
-	initialized := func(id acpsdk.SessionId) {
+	steering, _ := init.Meta["steering"].(map[string]any)
+	p.steering, _ = steering["supported"].(bool)
+	// initialized applies the session's model and effort, then reports the model the agent runs.
+	initialized := func(id acpsdk.SessionId, opts []acpsdk.SessionConfigOption, notices ...string) {
 		p.acpSID = id
-		ev := core.Initialized{CLISessionID: string(id)}
+		p.mu.Lock()
+		p.opts = opts
+		p.mu.Unlock()
+		notices = append(notices, p.applySession(ctx, s)...)
+		ev := core.Initialized{CLISessionID: string(id), Model: p.currentModel()}
 		if init.AgentInfo != nil {
 			ev.Version = init.AgentInfo.Version
 		}
 		p.emit(ev)
+		for _, n := range notices {
+			p.emit(core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: n}}})
+		}
 	}
 	servers := p.mcpServers(init)
 	var notice string // why a session the agent has seen before starts fresh
 	if s.CLISessionID != "" {
 		if !init.AgentCapabilities.LoadSession {
 			notice = "history was not restored: this agent can't reload a session yet, so this is a fresh conversation"
-		} else if _, err := p.load(ctx, acpsdk.SessionId(s.CLISessionID), s.Cwd, servers); err != nil {
+		} else if _, opts, err := p.load(ctx, acpsdk.SessionId(s.CLISessionID), s.Cwd, servers); err != nil {
 			notice = "history was not restored: " + err.Error() + ", so this is a fresh conversation"
 		} else {
 			// The replay is dropped: the session's entries already hold it, or EnsureLoaded loads it.
-			initialized(acpsdk.SessionId(s.CLISessionID))
+			initialized(acpsdk.SessionId(s.CLISessionID), opts)
 			return nil
 		}
 	}
@@ -263,9 +279,10 @@ func (p *process) handshake(s *core.Session) error {
 	if sess.SessionId == "" {
 		return errors.New("session/new: the agent returned no sessionId")
 	}
-	initialized(sess.SessionId)
 	if notice != "" {
-		p.emit(core.UserMessage{Entries: []core.Entry{{Kind: "info", Text: notice}}})
+		initialized(sess.SessionId, sess.ConfigOptions, notice)
+	} else {
+		initialized(sess.SessionId, sess.ConfigOptions)
 	}
 	return nil
 }
@@ -283,18 +300,72 @@ func failureText(err error) string {
 	return err.Error()
 }
 
-// SendUser sends a prompt at once when idle. Mid-turn there is no steering yet: the message is
-// held and sent as the next prompt when the turn ends.
+// SendUser sends a prompt at once when idle. Mid-turn it steers the turn when the agent can, and
+// otherwise holds the message to send as the next prompt when the turn ends.
 func (p *process) SendUser(text, uuid string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.running {
-		p.held = append(p.held, heldMessage{text, uuid})
+	if !p.running && p.steers == 0 {
+		p.running = true
+		go p.turns(text, uuid)
 		return nil
 	}
-	p.running = true
-	go p.turns(text, uuid)
+	// Each message waits for the one before it to be answered, so they reach the agent in order.
+	prev, done := p.steerEnd, make(chan struct{})
+	p.steerEnd = done
+	p.steers++
+	go func() {
+		if prev != nil {
+			<-prev
+		}
+		p.steer(heldMessage{text, uuid})
+		p.mu.Lock()
+		p.steers--
+		p.mu.Unlock()
+		close(done)
+	}()
 	return nil
+}
+
+// steer sends a mid-turn message into the running turn, or holds it. Once any message is held, later
+// ones are too, until the held ones have gone out, so the order is kept.
+func (p *process) steer(m heldMessage) {
+	<-p.ready
+	if p.acpSID == "" {
+		return // Exited reports it
+	}
+	p.mu.Lock()
+	if !p.steering || !p.running || len(p.held) > 0 {
+		p.hold(m)
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	resp, err := p.conn.Steer(context.Background(), steerRequest{SessionId: p.acpSID, Prompt: []acpsdk.ContentBlock{acpsdk.TextBlock(m.text)},
+		Meta: map[string]any{"steering": map[string]any{"idleBehavior": "promptRequired"}}})
+	switch {
+	case err == nil && resp.Outcome == "injected":
+		p.emit(core.Consumed{UUID: m.uuid})
+	case err == nil && resp.Outcome == "startedNewTurn":
+		// shortcut: ACP says nothing when a turn the agent started itself ends, so hearth shows no
+		// turn for it; its updates stream as usual. Upgrade when an agent reports that turn's end.
+		p.emit(core.Consumed{UUID: m.uuid})
+	default: // promptRequired, failed, an error or an outcome hearth doesn't know
+		p.mu.Lock()
+		p.hold(m)
+		p.mu.Unlock()
+	}
+}
+
+// hold queues m to go out as a prompt when the turn ends, or sends it now when that has already happened.
+// p.mu is held.
+func (p *process) hold(m heldMessage) {
+	if !p.running {
+		p.running = true
+		go p.turns(m.text, m.uuid)
+		return
+	}
+	p.held = append(p.held, m)
 }
 
 // turns runs the prompt, then each message held meanwhile, until none is left.
@@ -387,9 +458,7 @@ func (p *process) SetPermissionMode(mode string) string {
 	p.mu.Unlock()
 	return p.reply(core.Reply{})
 }
-func (p *process) SetModel(string) string  { return p.unsupported("switching models") }
-func (p *process) SetEffort(string) string { return p.unsupported("setting an effort") }
-func (p *process) Rename(string) string    { return p.unsupported("renaming a session") }
+func (p *process) Rename(string) string { return p.unsupported("renaming a session") }
 func (p *process) GenerateTitle(string) string {
 	return p.unsupported("generating a title")
 }

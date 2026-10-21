@@ -107,6 +107,12 @@ config.
   `thought_level`.
 - **Models.** The launcher's listing starts a throwaway agent, as the Claude
   backend does, and reads `configOptions` from a `session/new`.
+  - Each model's efforts come from `_meta.efforts` on its choice in the
+    `model` option; grimalkin provides it. For a choice without it, the
+    listing switches the throwaway session to that model and reads
+    `thought_level`.
+  - The throwaway session is closed with `session/close` when the agent
+    advertises it.
 - **Capabilities.** `Rewind: false`, `Unqueue: false`.
   - Rejected: an unsteer extension. Steering delivers within a tool round, so
     there's little window to pull a message back.
