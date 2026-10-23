@@ -159,6 +159,7 @@ input {
   text-decoration: none;
 }
 .head { flex: 1; min-width: 0; }
+.pick { flex: none; max-width: 42%; padding: 0 12px; border-radius: 99px; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sub { color: var(--dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .tabs { display: flex; gap: 8px; overflow-x: auto; padding: 8px 14px; border-bottom: 1px solid var(--line); scrollbar-width: none; }
@@ -246,6 +247,10 @@ textarea {
 }
 .dirs { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .dirs button { width: 100%; display: grid; text-align: left; padding: 10px 14px; gap: 2px; }
+.sheet h2:not(:first-child) { margin-top: 20px; }
+.opts { display: flex; flex-wrap: wrap; gap: 8px; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.dirs button[aria-pressed="true"] .title::after { content: " ✓"; }
 
 @media (min-width: 760px) {
   #app { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }

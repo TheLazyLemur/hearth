@@ -18,7 +18,8 @@ the daemon unchanged.
   WebSocket one message per frame. hearth assumes nothing about what sits in front of it: TLS,
   a proxy or a tailnet are the user's to add, so a browser gets in only by pairing with the token
   in `HEARTH_HOME/web.token`, and the socket refuses other origins. Sessions, transcripts, agent
-  tabs, sending, stopping, permission and question cards, and new sessions in known folders.
+  tabs, sending, stopping, permission and question cards, new sessions in known folders, and a
+  sheet for each session's model, effort and permission mode.
 - **Shell panel.** One shell per session, in a side panel toggled with ctrl+t. The daemon owns
   the pty and its screen, so a shell outlives `:q` and every instance shows it, as in a
   multiplexer. The instance that last focused it sets its size.
@@ -45,8 +46,7 @@ parent in the sidebar. Needs research first; draft notes in `docs/specs/nested-s
   transcript text. Needs a manifest and service worker, so HTTPS from whatever fronts it.
 - Reconnect and per-session subscriptions from §1: a phone reconnects every time it's opened,
   and each time takes a full snapshot.
-- Markdown in assistant text; model, effort and mode pickers; rewind, unqueue and chips; the
-  shell panel.
+- Markdown in assistant text; rewind, unqueue and chips; the shell panel.
 - New sessions in a typed folder, once the daemon checks the folder exists.
 
 ### 4. Backends

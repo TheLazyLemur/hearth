@@ -4,7 +4,7 @@
 // the TUI's.
 
 const version = document.documentElement.dataset.version
-const S = { sessions: [], live: {}, backends: {}, notice: '', conn: 'connecting', paired: null, epoch: 0, archived: false, sheet: null }
+const S = { sessions: [], live: {}, backends: {}, models: {}, notice: '', conn: 'connecting', paired: null, epoch: 0, archived: false, sheet: null }
 const dirty = {} // by session: the first entry changed since its transcript was drawn
 const pending = new Map()
 let ws, nextId = 0, retry = 500, timer
@@ -74,6 +74,7 @@ function take(snap) {
   S.sessions = snap.sessions || []
   S.live = snap.live || {}
   S.backends = snap.backends || {}
+  S.models = snap.models || {}
   if (snap.notice) S.notice = snap.notice
   S.epoch++ // every transcript is drawn afresh
 }
@@ -85,6 +86,7 @@ function applyChange(ch) {
     return
   }
   if (ch.notice != null) S.notice = ch.notice
+  if (ch.models) S.models[ch.models.backend] = ch.models.items // null while it lists
   const s = ch.session
   if (!s) return
   const i = S.sessions.findIndex(o => o.sessionId === s.sessionId)
@@ -169,7 +171,7 @@ function h(tag, props, ...kids) {
     else if (k === 'class') el.className = v
     else if (v != null && v !== false) el.setAttribute(k, v === true ? '' : v)
   }
-  el.append(...kids.flat().filter(k => k != null && k !== false && k !== ''))
+  el.append(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== ''))
   return el
 }
 
@@ -213,13 +215,18 @@ function render() {
   }
   const key = S.paired === false ? 'pair' : id ? 's/' + id : 'list'
   if (view.key !== key) {
+    if (S.sheet?.settings) S.sheet = null // it belongs to the session being left
     view = { key, ...(key === 'pair' ? pairView() : id ? sessionView(id) : listView()) }
     app.replaceChildren(view.el)
   }
   view.update?.()
   toast.textContent = S.notice
   toast.hidden = !S.notice
-  keep(overlay, JSON.stringify([S.sheet, S.sheet && S.sessions.length]), () => S.sheet && sheet())
+  const ss = S.sheet?.settings && S.sessions.find(o => o.sessionId === S.sheet.settings)
+  const top = overlay.querySelector('.sheet')?.scrollTop // a pick redraws the sheet; stay where the tap was
+  keep(overlay, JSON.stringify([S.sheet, S.sheet && S.sessions.length,
+    ss && [ss.model, ss.effort, ss.permissionMode, S.live[ss.sessionId]?.Model, S.models[ss.backend]]]), () => S.sheet && sheet())
+  if (top) overlay.querySelector('.sheet').scrollTop = top
 }
 
 function pairView() {
@@ -266,6 +273,7 @@ function listView() {
 function sessionView(id) {
   const title = h('h1', {})
   const sub = h('div', { class: 'sub' })
+  const pick = h('button', { class: 'pick', 'aria-haspopup': 'dialog', onclick: () => openSettings(id) })
   const tabs = h('nav', { class: 'tabs', 'aria-label': 'Agents' })
   const log = h('div', { class: 'log' })
   const queue = h('div', { class: 'log queued' })
@@ -288,7 +296,7 @@ function sessionView(id) {
   })
   const el = h('div', { class: 'view' },
     h('header', {}, h('a', { href: '#', class: 'back', 'aria-label': 'Sessions' }, '‹'),
-      h('div', { class: 'head' }, title, sub)),
+      h('div', { class: 'head' }, title, sub), pick),
     tabs, scroller,
     h('div', { class: 'composer' }, input, stop, send))
 
@@ -320,8 +328,12 @@ function sessionView(id) {
       }
       const caps = S.backends[s.backend || 'claude']
       keep(title, s.title || 'Untitled', () => s.title || 'Untitled')
-      keep(sub, JSON.stringify([s.originCwd, s.branch, caps, s.model, l.Model]), () =>
-        [base(s.originCwd), s.branch && '⎇ ' + s.branch, caps?.label, s.model || l.Model].filter(Boolean).join(' · '))
+      const mode = (s.permissionMode || 'default') !== 'default' && modes.find(m => m[0] === s.permissionMode)?.[1]
+      keep(sub, JSON.stringify([s.originCwd, s.branch, caps, mode]), () =>
+        [base(s.originCwd), s.branch && '⎇ ' + s.branch, caps?.label, mode].filter(Boolean).join(' · '))
+      const cur = s.model || l.Model, named = S.models[s.backend]?.find(m => m.ID === cur)?.Name
+      const chosen = (named || cur || 'Model') + (s.effort ? ' · ' + s.effort : '')
+      keep(pick, chosen, () => [chosen, h('span', { 'aria-hidden': 'true' }, ' ▾')])
 
       const r = root(s), agents = agentsOf(r)
       keep(tabs, JSON.stringify([agents.length && [r, ...agents].map(a => [a.sessionId, a.title, statusOf(a)])]), () =>
@@ -416,9 +428,49 @@ function alwaysLabel(sug) {
   return 'Yes, and don’t ask again'
 }
 
+// modes are the permission modes, as the TUI cycles them, with the names it shows.
+const modes = [['default', 'Default'], ['acceptEdits', 'Accept edits'], ['plan', 'Plan'], ['auto', 'Auto']]
+const efforts = ['low', 'medium', 'high', 'xhigh', 'max']
+
+function openSettings(id) {
+  const s = S.sessions.find(o => o.sessionId === id)
+  if (S.models[s.backend] === undefined) {
+    S.models[s.backend] = null // listing; the list arrives as a change, as client.go asks
+    act('models', { session: id })
+  }
+  S.sheet = { settings: id }
+  draw()
+}
+
+// settings sets a session's model, effort and mode, each tap at once, so the sheet stays open.
+function settings(id) {
+  const s = S.sessions.find(o => o.sessionId === id)
+  if (!s) return []
+  const ms = S.models[s.backend], current = s.model || S.live[id]?.Model
+  const listed = ms?.find(m => m.ID === current)
+  // a model the list doesn't name may take any level, as the TUI's /effort allows
+  const levels = ms == null ? [] : listed ? listed.Efforts || [] : efforts
+  const opt = (on, onclick, ...kids) => h('button', { 'aria-pressed': on ? 'true' : 'false', onclick }, ...kids)
+  // the short rows first: a backend can list a dozen models
+  return [
+    h('h2', {}, 'Permission mode'),
+    h('div', { class: 'opts' }, modes.map(([m, name]) =>
+      opt((s.permissionMode || 'default') === m, () => act('setMode', { session: id, mode: m }), name))),
+    levels.length > 0 && [h('h2', {}, 'Effort'), h('div', { class: 'opts' },
+      opt(!s.effort, () => act('setEffort', { session: id, effort: '' }), 'Default'),
+      levels.map(e => opt(s.effort === e, () => act('setEffort', { session: id, effort: e }), e)))],
+    h('h2', {}, 'Model'),
+    ms == null ? h('p', { class: 'hint' }, 'Loading models…')
+      : !ms.length ? h('p', { class: 'hint' }, 'This backend lists no models')
+      : h('ul', { class: 'dirs' }, ms.map(m => h('li', {},
+          opt(m.ID === current, () => act('setModel', { session: id, model: m.ID }),
+            h('span', { class: 'title' }, m.Name || m.ID), m.Description && h('span', { class: 'meta' }, m.Description))))),
+  ]
+}
+
 function sheet() {
   const close = () => { S.sheet = null; draw() }
-  const body = S.sheet === 'new' ? pickFolder() : [
+  const body = S.sheet === 'new' ? pickFolder() : S.sheet.settings ? settings(S.sheet.settings) : [
     h('h2', {}, 'Work in an isolated git worktree?'),
     h('p', { class: 'hint' }, S.sheet.dir),
     h('div', { class: 'choices' },
@@ -426,7 +478,8 @@ function sheet() {
       h('button', { onclick: () => create(S.sheet.dir, false) }, 'No, in the folder itself')),
   ]
   return h('div', { class: 'backdrop', onclick: e => e.target === e.currentTarget && close() },
-    h('section', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' }, body, h('button', { class: 'link', onclick: close }, 'Cancel')))
+    h('section', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' }, body,
+      h('button', { class: 'link', onclick: close }, S.sheet.settings ? 'Done' : 'Cancel')))
 }
 
 // shortcut: only folders hearth already has sessions in, so the daemon is never handed a path
