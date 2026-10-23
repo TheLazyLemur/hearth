@@ -13,6 +13,12 @@ the daemon unchanged.
   socket. Spec: `docs/specs/daemon.md`.
 - **`start_agent`.** Subagents as hearth sessions on any backend, shown as tabs of the session that
   started them. Spec: `docs/specs/start-agent.md`.
+- **Web client.** `hearth web [addr]` serves a phone-first page, embedded in the binary, on
+  `127.0.0.1:7420` by default. Each tab gets a daemon connection of its own, relayed over a
+  WebSocket one message per frame. hearth assumes nothing about what sits in front of it: TLS,
+  a proxy or a tailnet are the user's to add, so a browser gets in only by pairing with the token
+  in `HEARTH_HOME/web.token`, and the socket refuses other origins. Sessions, transcripts, agent
+  tabs, sending, stopping, permission and question cards, and new sessions in known folders.
 - **Shell panel.** One shell per session, in a side panel toggled with ctrl+t. The daemon owns
   the pty and its screen, so a shell outlives `:q` and every instance shows it, as in a
   multiplexer. The instance that last focused it sets its size.
@@ -33,17 +39,15 @@ A session starts other sessions, they report back, and the parent wakes when the
 `start_session`, `send_message`, `list_sessions`, `get_session`, and children nested under their
 parent in the sidebar. Needs research first; draft notes in `docs/specs/nested-sessions.md`.
 
-### 3. Web client
+### 3. Web client follow-ups
 
-A responsive PWA, served by a bridge in the hearth binary that relays the daemon's protocol over
-WebSocket, reached over Tailscale.
-
-- Bridge as a tailnet node (`tsnet`): TLS from MagicDNS, each connection checked against your
-  Tailscale login with `WhoIs`.
-- Web assets embedded in the binary, so client and daemon always speak the same protocol version.
 - Web Push for finished turns and permission requests; payloads carry a title and state, never
-  transcript text.
-- Needs reconnect and per-session subscriptions from §1: a phone reconnects every time it's opened.
+  transcript text. Needs a manifest and service worker, so HTTPS from whatever fronts it.
+- Reconnect and per-session subscriptions from §1: a phone reconnects every time it's opened,
+  and each time takes a full snapshot.
+- Markdown in assistant text; model, effort and mode pickers; rewind, unqueue and chips; the
+  shell panel.
+- New sessions in a typed folder, once the daemon checks the folder exists.
 
 ### 4. Backends
 

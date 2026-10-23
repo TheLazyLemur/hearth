@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"hearth/internal/cli"
 	"hearth/internal/core"
@@ -16,10 +19,12 @@ import (
 	"hearth/internal/shell"
 	"hearth/internal/store"
 	"hearth/internal/tui"
+	"hearth/internal/web"
 )
 
-// Run is the composition root: `hearth` runs the TUI against the daemon, `hearth daemon` runs
-// the daemon itself, which owns the app every instance is a client of.
+// Run is the composition root: `hearth` runs the TUI against the daemon, `hearth web` serves
+// browsers as clients of it, and `hearth daemon` runs the daemon itself, which owns the app
+// every instance is a client of.
 func Run(args []string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -31,6 +36,9 @@ func Run(args []string) error {
 	}
 	if len(args) > 0 && args[0] == "daemon" {
 		return runDaemon(args[1:], dir, home)
+	}
+	if len(args) > 0 && args[0] == "web" {
+		return runWeb(args[1:], dir)
 	}
 	launched, err := os.Getwd()
 	if err != nil {
@@ -97,6 +105,49 @@ func runDaemon(args []string, dir, home string) error {
 		fmt.Println("  running:", title)
 	}
 	return nil
+}
+
+// runWeb serves hearth to browsers on addr until it is killed. Each tab is a client of the
+// daemon of its own, so the daemon starts when a browser needs it, as it does for `hearth`.
+func runWeb(args []string, dir string) error {
+	addr := "127.0.0.1:7420"
+	switch len(args) {
+	case 0:
+	case 1:
+		addr = args[0]
+	default:
+		return errors.New("usage: hearth web [addr]")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	token, err := web.Token(filepath.Join(dir, "web.token"))
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("hearth web on http://%s\n", ln.Addr())
+	fmt.Printf("pair a browser: http://%s/#pair=%s (behind a proxy, the same /#pair=… on its address)\n", ln.Addr(), token)
+	srv := &http.Server{Handler: web.Handler(token, daemon.Version, func() (net.Conn, error) { return dialDaemon(dir) }),
+		ReadHeaderTimeout: 10 * time.Second}
+	return srv.Serve(ln)
+}
+
+// dialDaemon connects to the daemon for dir, starting one first when none runs.
+func dialDaemon(dir string) (net.Conn, error) {
+	sock := daemon.SocketPath(dir)
+	if conn, err := net.Dial("unix", sock); err == nil {
+		return conn, nil
+	}
+	c, err := daemon.Attach(dir)
+	if err != nil {
+		return nil, err
+	}
+	c.Close() // it stays up a while for the next client, which is the tab's own
+	return net.Dial("unix", sock)
 }
 
 // hearthDir is where hearth keeps its sessions and the daemon's socket, lock and log.
