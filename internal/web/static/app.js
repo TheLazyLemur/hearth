@@ -226,7 +226,7 @@ function render() {
   const ss = S.sheet?.settings && S.sessions.find(o => o.sessionId === S.sheet.settings)
   const top = overlay.querySelector('.sheet')?.scrollTop // a pick redraws the sheet; stay where the tap was
   keep(overlay, JSON.stringify([S.sheet, S.sheet && S.sessions.length,
-    ss && [ss.model, ss.effort, ss.permissionMode, S.live[ss.sessionId]?.Model, S.models[ss.backend]]]), () => S.sheet && sheet())
+    ss && [ss.backend, ss.cliSessionId, ss.model, ss.effort, ss.permissionMode, S.live[ss.sessionId]?.Model, S.models[ss.backend]]]), () => S.sheet && sheet())
   if (top) overlay.querySelector('.sheet').scrollTop = top
 }
 
@@ -437,12 +437,16 @@ function alwaysLabel(sug) {
 const modes = [['default', 'Default'], ['acceptEdits', 'Accept edits'], ['plan', 'Plan'], ['auto', 'Auto']]
 const efforts = ['low', 'medium', 'high', 'xhigh', 'max']
 
-function openSettings(id) {
+// listModels lists the models of id's backend, the first time a session on it asks.
+function listModels(id) {
   const s = S.sessions.find(o => o.sessionId === id)
-  if (S.models[s.backend] === undefined) {
-    S.models[s.backend] = null // listing; the list arrives as a change, as client.go asks
-    act('models', { session: id })
-  }
+  if (S.models[s.backend] !== undefined) return
+  S.models[s.backend] = null // listing; the list arrives as a change, as client.go asks
+  act('models', { session: id })
+}
+
+function openSettings(id) {
+  listModels(id)
   S.sheet = { settings: id }
   draw()
 }
@@ -456,8 +460,15 @@ function settings(id) {
   // a model the list doesn't name may take any level, as the TUI's /effort allows
   const levels = ms == null ? [] : listed ? listed.Efforts || [] : efforts
   const opt = (on, onclick, ...kids) => h('button', { 'aria-pressed': on ? 'true' : 'false', onclick }, ...kids)
+  const started = !!s.cliSessionId // the daemon refuses a new backend from here on
   // the short rows first: a backend can list a dozen models
   return [
+    h('h2', {}, 'Backend'),
+    h('div', { class: 'opts' }, Object.entries(S.backends).map(([b, caps]) =>
+      h('button', { 'aria-pressed': s.backend === b ? 'true' : 'false', disabled: started && s.backend !== b,
+        // the change carrying the new backend comes before the reply, so this lists its models
+        onclick: () => act('setBackend', { session: id, backend: b }).then(() => listModels(id)) }, caps.label))),
+    started && h('p', { class: 'hint' }, 'Fixed once the session has started'),
     h('h2', {}, 'Permission mode'),
     h('div', { class: 'opts' }, modes.map(([m, name]) =>
       opt((s.permissionMode || 'default') === m, () => act('setMode', { session: id, mode: m }), name))),

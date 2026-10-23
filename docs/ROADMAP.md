@@ -19,7 +19,7 @@ the daemon unchanged.
   a proxy or a tailnet are the user's to add, so a browser gets in only by pairing with the token
   in `HEARTH_HOME/web.token`, and the socket refuses other origins. Sessions, transcripts, agent
   tabs, sending, stopping, permission and question cards, new sessions in known folders, and a
-  sheet for each session's model, effort and permission mode.
+  sheet for each session's backend, model, effort and permission mode.
 - **Shell panel.** One shell per session, in a side panel toggled with ctrl+t. The daemon owns
   the pty and its screen, so a shell outlives `:q` and every instance shows it, as in a
   multiplexer. The instance that last focused it sets its size.
