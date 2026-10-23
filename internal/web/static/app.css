@@ -186,6 +186,21 @@ input {
 .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.user { align-self: flex-end; max-width: 88%; padding: 8px 12px; border-radius: 16px 16px 4px 16px; background: var(--panel); }
 .msg.error { color: var(--bad); }
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md :is(p, ul, ol, blockquote, table, pre) { margin: 0 0 8px; }
+.md :is(h1, h2, h3, h4, h5, h6) { font-size: 16px; margin: 14px 0 6px; white-space: normal; overflow: visible; }
+.md :is(h1, h2) { font-size: 18px; }
+.md :is(ul, ol) { padding-left: 22px; }
+.md a { color: var(--accent); }
+.md :not(pre) > code { font-size: 14px; padding: 1px 4px; border-radius: 4px; background: var(--panel); }
+.md pre { max-height: none; background: var(--panel); }
+.md blockquote { padding-left: 10px; border-left: 3px solid var(--line); color: var(--dim); }
+.md table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 14px; }
+.md :is(th, td) { padding: 4px 8px; border: 1px solid var(--line); text-align: left; }
+.md hr { border: none; border-top: 1px solid var(--line); }
+.md img { max-width: 100%; }
 .tool { font: 13px/1.4 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
 .tool::before { content: "▸ "; color: var(--accent); }
 .tool:not(.open) { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }

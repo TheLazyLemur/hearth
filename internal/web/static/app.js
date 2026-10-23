@@ -7,6 +7,7 @@ const version = document.documentElement.dataset.version
 const S = { sessions: [], live: {}, backends: {}, models: {}, notice: '', conn: 'connecting', paired: null, epoch: 0, archived: false, sheet: null }
 const dirty = {} // by session: the first entry changed since its transcript was drawn
 const pending = new Map()
+const md = markdownit() // its defaults escape raw HTML and refuse javascript: and data: links
 let ws, nextId = 0, retry = 500, timer
 
 // ---- protocol
@@ -361,11 +362,15 @@ function sessionView(id) {
   }
 }
 
-// shortcut: text is shown as written, markdown unrendered; add a renderer if reading suffers
 function entry(e) {
   switch (e.Kind) {
     case 'user': return h('div', { class: 'msg user' }, e.Text)
-    case 'assistant': return h('div', { class: 'msg' }, e.Text)
+    case 'assistant': {
+      const el = h('div', { class: 'msg md' })
+      el.innerHTML = md.render(e.Text || '')
+      for (const a of el.querySelectorAll('a')) a.target = '_blank' // following a link mustn't drop the session
+      return el
+    }
     case 'tool': return h('div', { class: 'tool', onclick: ev => ev.currentTarget.classList.toggle('open') }, e.Text)
     case 'result': {
       const lines = (e.Text || '').trimEnd().split('\n')

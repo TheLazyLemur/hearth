@@ -46,7 +46,7 @@ parent in the sidebar. Needs research first; draft notes in `docs/specs/nested-s
   transcript text. Needs a manifest and service worker, so HTTPS from whatever fronts it.
 - Reconnect and per-session subscriptions from §1: a phone reconnects every time it's opened,
   and each time takes a full snapshot.
-- Markdown in assistant text; rewind, unqueue and chips; the shell panel.
+- Rewind, unqueue and chips; the shell panel.
 - New sessions in a typed folder, once the daemon checks the folder exists.
 
 ### 4. Backends
