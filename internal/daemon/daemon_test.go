@@ -322,6 +322,27 @@ func TestInstancesSeeAnAgentStartAndReportToItsParent(t *testing.T) {
 	})
 }
 
+func TestDeletingASessionDeletesItsAgentsEverywhere(t *testing.T) {
+	// given
+	// ... two instances, a session the user started, its agent, that agent's own agent, and an unrelated session
+	root := &core.Session{SessionID: "local_root", Title: "root", OriginCwd: "/p", TitleSource: "user"}
+	c1 := &core.Session{SessionID: "local_c1", Title: "c1", OriginCwd: "/p", SpawnedFrom: &core.SpawnedFrom{SessionID: "local_root", Kind: "agent"}}
+	c2 := &core.Session{SessionID: "local_c2", Title: "c2", OriginCwd: "/p", SpawnedFrom: &core.SpawnedFrom{SessionID: "local_c1", Kind: "agent"}}
+	other := &core.Session{SessionID: "local_other", Title: "other", OriginCwd: "/p", TitleSource: "user"}
+	h := testfakes.NewHarness(t, time.Hour, root, c1, c2, other)
+	a, b := h.Dial(t), h.Dial(t)
+
+	// when
+	// ... one instance deletes the session the user started
+	if err := a.Delete(root); err != nil {
+		t.Fatal(err)
+	}
+
+	// then
+	// ... the other instance is left with only the unrelated session
+	drain(t, b, func() bool { return len(b.Sessions()) == 1 && b.Sessions()[0].SessionID == "local_other" })
+}
+
 func TestShellTypedIntoInOneInstanceShowsInEveryOneUntilItExits(t *testing.T) {
 	// given
 	// ... two instances, one of which opens the session's shell
