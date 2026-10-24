@@ -445,7 +445,21 @@ func (a *App) AnswerQuestion(s *Session, text string) error {
 	return nil
 }
 
+// Delete drops s and the agents under it, which share its checkout and have no one left to report to.
 func (a *App) Delete(s *Session) error {
+	agents := a.AgentsUnder(s) // before s leaves a.sessions, which the lookup walks
+	if err := a.deleteOne(s); err != nil {
+		return err
+	}
+	for _, c := range agents {
+		if err := a.deleteOne(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) deleteOne(s *Session) error {
 	l := a.L(s.SessionID)
 	if l.agent != nil {
 		l.agent.Close()

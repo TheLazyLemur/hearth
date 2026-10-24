@@ -463,17 +463,21 @@ func (d *Daemon) apply(p *peer, id int, method string, a args) (any, error) {
 		return child.SessionID, nil
 	case "delete":
 		ss := s()
-		if err := d.app.Delete(ss); err != nil {
-			return nil, err
-		}
-		d.send(msg{Change: &change{Deleted: ss.SessionID}})
-		d.forget(ss.SessionID)
-		for _, w := range slices.Clone(d.waits) {
-			if w.session == ss.SessionID {
-				d.finish(w, nil, errors.New("session deleted"))
+		gone := append([]*core.Session{ss}, d.app.AgentsUnder(ss)...)
+		err := d.app.Delete(ss)
+		for _, g := range gone {
+			if d.app.Find(g.SessionID) != nil {
+				continue // kept: its worktree, or a later agent's file, could not be removed
+			}
+			d.send(msg{Change: &change{Deleted: g.SessionID}})
+			d.forget(g.SessionID)
+			for _, w := range slices.Clone(d.waits) {
+				if w.session == g.SessionID {
+					d.finish(w, nil, errors.New("session deleted"))
+				}
 			}
 		}
-		return nil, nil
+		return nil, err
 	case "answerPerm":
 		err := d.app.AnswerPerm(s(), a.Allow, a.Always)
 		d.changed(a.Session)

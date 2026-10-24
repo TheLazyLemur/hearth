@@ -242,6 +242,20 @@ func Agents(ss []*Session) map[string][]*Session {
 	return out
 }
 
+// AgentsUnder lists the agents s started, and theirs, at any depth.
+func (a *App) AgentsUnder(s *Session) []*Session {
+	var out []*Session
+	for _, x := range a.sessions {
+		for p := x; p != nil && p.SpawnedFrom != nil && p.SpawnedFrom.Kind == "agent"; {
+			if p = a.Find(p.SpawnedFrom.SessionID); p == s {
+				out = append(out, x)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // agentDepth counts the start_agent links above s.
 func (a *App) agentDepth(s *Session) int {
 	d := 0
