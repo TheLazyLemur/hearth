@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"hearth/internal/acp"
 	"hearth/internal/cli"
 	"hearth/internal/core"
 	"hearth/internal/daemon"
@@ -165,6 +166,7 @@ func hearthDir(home string) (string, error) {
 // newApp builds the app the daemon owns; instances never touch it, only its protocol.
 func newApp(dir, home string) (*core.App, error) {
 	claudeConfig := cmp.Or(os.Getenv("CLAUDE_CONFIG_DIR"), filepath.Join(home, ".claude"))
+	grimalkin := acp.Launcher{Binary: cmp.Or(os.Getenv("HEARTH_GRIMALKIN_CLI"), "grimalkin"), Args: []string{"acp"}}
 	app, err := core.NewApp(store.Store{Dir: filepath.Join(dir, "sessions")}, map[string]core.Backend{
 		core.DefaultBackend: {Label: "Claude Code", Tag: "cl", Rewind: true, Unqueue: true,
 			Launcher:    cli.Launcher{Binary: cmp.Or(os.Getenv("HEARTH_CLAUDE_CLI"), "claude")},
@@ -173,6 +175,9 @@ func newApp(dir, home string) (*core.App, error) {
 			Launcher: pi.Launcher{Binary: "pi"},
 			Transcripts: pi.Transcripts{Dir: cmp.Or(os.Getenv("PI_CODING_AGENT_SESSION_DIR"),
 				filepath.Join(cmp.Or(os.Getenv("PI_CODING_AGENT_DIR"), filepath.Join(home, ".pi", "agent")), "sessions"))}},
+		"grimalkin": {Label: "grimalkin", Tag: "gr",
+			Launcher:    grimalkin,
+			Transcripts: acp.Transcripts{Launcher: grimalkin}},
 	}, git.Worktrees{}, shell.Shells{})
 	if err != nil {
 		return nil, fmt.Errorf("load sessions: %w", err)
