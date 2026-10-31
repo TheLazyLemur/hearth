@@ -32,13 +32,14 @@ the daemon unchanged.
 - Per-session subscriptions, so a client loads only the transcripts it shows.
 - Notifications while nobody is attached. Reverses the daemon's "permissions wait, no
   notifications" decision.
-- SSH over a forwarded socket.
+- SSH over a forwarded socket, or §5's network listener.
 
 ### 2. Nested sessions
 
 A session starts other sessions, they report back, and the parent wakes when they finish:
 `start_session`, `send_message`, `list_sessions`, `get_session`, and children nested under their
 parent in the sidebar. Needs research first; draft notes in `docs/specs/nested-sessions.md`.
+Session IDs must name their host, so messages can cross hosts (§5).
 
 ### 3. Web client follow-ups
 
@@ -58,6 +59,119 @@ Every backend must start, resume, interrupt and queue mid-turn messages; emit st
 serve `core.Tools` and route every other tool through hearth's permissions; and accept appended
 system-prompt text. Fork, rewind, unqueue, permission modes and model listing are optional
 capabilities, kept as bools until a third backend shows the right shape.
+
+Backends to add once the shape holds: Codex, Gemini, Cursor, OpenCode, and any ACP agent through a
+generic ACP backend (open as #9).
+
+### 5. Multiple hosts
+
+A daemon on each host, one of them running as the hub. A client attaches to the hub to see and
+start sessions on any host. Builds on §1's remote attach and §2's messaging.
+
+- **Network listener.** The daemon listens on an address as well as its Unix socket. Daemons
+  and clients pair with a token, as the web client does; hearth still assumes nothing about the
+  network, so the tailnet is the user's to add.
+- **Hub mode.** The hub is a client of each worker's daemon and merges their snapshots and
+  changes into one. Sessions gain a host; a new session goes to the host it names, and the
+  folder picker asks that host.
+- **Cross-host routing.** `send_message` and agent reports reach sessions on other hosts
+  through the hub. Running sessions carry on while the hub is down.
+- **Credential broker.** The hub holds the only long-lived secrets: a GitHub App key, minting
+  tokens scoped to a job's repos, and a Bitbucket OAuth consumer using client credentials. A
+  token lasts the whole job, so a running job still pushes if the hub drops. Workers fetch them
+  through a git credential helper.
+- **Memory sync.** The hub holds the source of truth; each host keeps a git copy, pulled when
+  a session starts and pushed when it writes. An agent merges conflicts, and only
+  contradictions reach the user.
+
+Later, once the above works:
+
+- Each host's load shown, with an option to route a new session to the least loaded.
+- More than one route to a host (tailnet, LAN, SSH), tried in order, with permissions per route.
+- Run a command on one host or all of them.
+- Update hearth and the agent CLIs on every host at once.
+- Move a project to another host: clone it there, optionally copying gitignored files like
+  `.env`.
+- Open a session's folder in an editor, over SSH when it lives elsewhere.
+- Dedicate hosts to roles, e.g. a Mac other hosts use to run iOS builds.
+- Expose a worker's dev server as a hostname, through whatever fronts the hub.
+
+## Later
+
+Features hearth wants that aren't built or planned yet, kept here so none are lost.
+Each needs its own spec before it is built; order within a section is rough priority.
+
+### Session list
+
+Every session is opened to be closed: the list shows only what still needs the user.
+
+- Archive with undo. Archived sessions sit at the bottom of the list.
+- Snooze a session until a time; it comes back on its own.
+- Auto-archive when the session's PR merges, and after N idle days (default 3); both configurable,
+  and off per session.
+- A session that needs the user (a permission, a question) jumps to the top with a marker.
+- Optional running group that hides sessions while they run; starred sessions stay visible.
+- Send in the background: start a session or message without opening it.
+- Select several sessions and archive, snooze or regenerate titles at once.
+- Drafts that survive switching away and can be moved, images included, to another session.
+- Interrupt or queue for mid-turn messages, as a setting with a key to swap.
+
+### Orchestration
+
+- Expose hearth over MCP so other agents and apps can list, start, message and archive sessions,
+  as an external client of the daemon. Scoped to what each connection is allowed.
+- Any session can find and message any other, across projects, and start sessions in other
+  projects. Widens §2's family-only tools.
+- Drag a session into another to give it that session's context.
+- Move a running session to another backend or model, carrying its context over.
+- Several instances of one backend, each with its own home directory, env and account, for
+  rotating subscriptions.
+
+### Scheduled and triggered sessions
+
+- Run a session on a schedule; it reappears in the session list when it has something to say.
+- Hold a message until a rate limit resets, then send it.
+- Start a session from a webhook (PR opened, Stripe event, a curl), with an optional hold and
+  replay window when the daemon is down.
+
+### Git and PRs
+
+- Link a session to the PRs it opened.
+- PR list and viewer in every client: diff, checks, merge; sort by merge readiness.
+- PR babysitting built in, so agents don't each reinvent polling, and cheap on API rate limits.
+- Providers past GitHub: GitLab, Bitbucket, Forgejo, Azure DevOps.
+
+### Projects
+
+- Sessions with no project.
+- New project from the client: name it, pick its host, optionally create the remote repo.
+- Worktree policy per project: always, never, ask.
+- Project icon from its favicon, or picked.
+
+### Rendering and input
+
+- Agents can render HTML: charts, diagrams, interactive widgets, shown inline in the web client.
+- Attachments saved to a path the agent can use, not only shown to the model, so it can put an
+  image in a PR. Images and video viewable over remote connections.
+- Annotate: select text in a transcript, comment, and send the comments with the next message.
+- Snapshot: a global hotkey captures the focused app's content into a new session.
+- Simulators and a headless browser running on another host (§5), viewed and driven from the client.
+
+### Usage
+
+- Tokens and limits per account and backend, read from each backend's own records so usage outside
+  hearth counts too.
+
+### Settings and look
+
+- Settings scoped to everywhere, a host, or a project, with a view of what is set where.
+- Configurable keybindings.
+- Themes, including VS Code theme import, and custom fonts.
+
+### Support
+
+- `hearth triage`: hands logs and setup to an agent to fix a broken install, and drafts an issue
+  when the bug is hearth's.
 
 ## Deferred until it hurts
 
