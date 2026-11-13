@@ -73,11 +73,15 @@ A daemon on each machine, all equal; no hub to go down. This is baton
 Decision: `docs/decisions/0001-consensus-instead-of-a-hub.md`. Builds on §1's remote attach and
 §2's messaging.
 
-- **Path spike first.** Can a session move between machines where the project sits at
-  different paths, by rebuilding only the transcript's location and metadata (never a message's
-  content, so the prompt cache holds) and appending a notice with the new paths? Decides whether
-  multi-machine sessions run in the user's own folders or under one root at the same path on
-  every machine (baton's ADR-0023). Untested: Claude Code's system prompt carries the cwd.
+- **Paths: answered (baton's spike S17 and live test S18, ADR-0026).** A session moves between
+  machines whose project paths differ: the new owner writes the transcript into its own project
+  folder, rewrites each row's `cwd` (metadata only, never message content) and appends a notice
+  with the new paths. The first call after the move read the whole conversation from cache
+  (44,216 read, 1,347 written). So no shared absolute root: each machine keeps its own (baton's
+  default `~/.baton/workspace`), which opens the way to sessions in the user's own folders.
+  Restore also fetches the newest checkpoint from the peers, or a machine that lost its repo
+  resumes from an older one (found in S18). Still to measure: large saved tool outputs and a
+  long real session.
 - **Cluster.** Embedded etcd on three voters (two places at least), mutual TLS between daemons
   with the cluster's own CA, `init` / `invite` / `join` with single-use join tokens (baton's
   ADR-0025). Clients and the web page keep hearth's token pairing.
