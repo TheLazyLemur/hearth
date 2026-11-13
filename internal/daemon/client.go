@@ -42,6 +42,10 @@ type Client struct {
 	closeOnce sync.Once
 }
 
+// inQueue is how many changes an instance holds undrained before it lets go, as the daemon
+// does at outQueue: reading eagerly hides a stalled loop from the daemon's own limit.
+const inQueue = 4096
+
 // ErrGone is what a client's Err wraps when the daemon's side of the connection ended.
 var ErrGone = errors.New("daemon exited")
 
@@ -109,6 +113,12 @@ func (c *Client) read() {
 			}
 			c.mu.Unlock()
 		case m.Change != nil:
+			if len(c.changes) >= inQueue {
+				c.err = errors.New("disconnected: too slow")
+				c.mu.Unlock()
+				c.conn.Close()
+				return
+			}
 			c.changes = append(c.changes, m.Change)
 			c.mu.Unlock()
 			if m.Change.Shell != nil {

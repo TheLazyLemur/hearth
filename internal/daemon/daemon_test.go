@@ -128,6 +128,31 @@ func TestInstanceThatStopsReadingIsDroppedNotTheDaemon(t *testing.T) {
 	drain(t, b, func() bool { return b.Find(s.SessionID).Title == "render markdown" })
 }
 
+func TestInstanceThatStopsDrainingLetsGoRatherThanQueueForever(t *testing.T) {
+	// given
+	// ... an instance whose event loop stopped draining, as one blocked on its terminal would
+	s := &core.Session{SessionID: "local_1", Title: "render", OriginCwd: "/p", TitleSource: "user"}
+	h := testfakes.NewHarness(t, time.Hour, s)
+	stuck, b := h.Dial(t), h.Dial(t)
+
+	// when
+	// ... another instance makes more changes than the stuck one may hold
+	for i := range 5000 {
+		b.Rename(s, fmt.Sprint("render ", i))
+	}
+
+	// then
+	// ... the stuck instance disconnects as too slow instead of queueing without bound
+	select {
+	case <-stuck.Closed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stuck instance kept queueing")
+	}
+	if err := stuck.Err(); err.Error() != "disconnected: too slow" {
+		t.Fatalf("err %v", err)
+	}
+}
+
 func TestDaemonExitsWhenIdleButNotMidTurn(t *testing.T) {
 	// given
 	// ... a daemon that leaves soon after it goes quiet, with a turn running
